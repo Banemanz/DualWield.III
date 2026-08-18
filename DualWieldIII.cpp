@@ -1,1 +1,5 @@
-PLACEHOLDER
+#include "src/DualWieldIII_01.inc"
+#include "src/DualWieldIII_02.inc"
+#include "src/DualWieldIII_03.inc"
+#include "src/DualWieldIII_04.inc"
+#include "src/DualWieldIII_05.inc"
