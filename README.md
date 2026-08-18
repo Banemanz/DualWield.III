@@ -9,7 +9,7 @@ The second weapon is rendered as a standalone `RpAtomic` outside the player ped 
 Source is in `DualWieldIII.cpp`. Configuration is in `DualWieldIII.ini`.
 
 
-TODO:
+## TODO:
 
 Gameplay integration (Stats system or cheat to activate)
 Fix remaining visual bugs.
