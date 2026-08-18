@@ -7,3 +7,10 @@ Supports the Colt .45 and Uzi with a second visible weapon, dual firing, native 
 The second weapon is rendered as a standalone `RpAtomic` outside the player ped clump. Both the stock PC `RwFrame` skeleton and Skin & Bones/Xbox HAnim skeletons are supported, with compatibility safeguards for ragdoll/render mods.
 
 Source is in `DualWieldIII.cpp`. Configuration is in `DualWieldIII.ini`.
+
+
+TODO:
+
+Gameplay integration (Stats system or cheat to activate)
+Fix remaining visual bugs.
+Prevent/Address potential crashes.
