@@ -1,0 +1,44 @@
+DualWieldIII v7 - V3Baseline SkinBonesCompat
+=============================================
+
+Why v6 could stop the 0x5B1791 crash but show no dual-wield change on the modded install:
+
+Skin & Bones (aap/iii_anim) ports the Xbox skinned/HAnim ped path. On a skinned ped,
+AnimBlendFrameData's pointer slot is an HAnim interpolation-frame pointer, not the stock
+PC RwFrame used by GTA III's normal skeleton. v6 treated m_apFrames[] as RwFrames, so its
+frame validation/weapon binding and mirror path could not correctly operate on that player.
+
+Skin & Bones also patches the exact CPed::Render -> CEntity::Render CALL at 0x4D0484 that
+Plugin-SDK's pedRenderEvent uses. Using the event and Skin & Bones together therefore creates
+a real load-order/hook-ownership conflict.
+
+v7 changes only the compatibility backend, not the preferred v3 aiming style:
+
+- Stock PC ped: v3 RwFrame mirror path.
+- Skin & Bones/Xbox skinned ped: HAnim matrix-array path using GTA/Xbox bone IDs
+  Supperarmr=10, Slowerarmr=11, SRhand=12, Supperarml=13, Slowerarml=14, SLhand=15.
+- No CPedIK call-site hook. Skin & Bones keeps ownership of its replacement IK.
+- No Plugin-SDK pedRenderEvent. v7 waits until gameProcess (after ASI startup), then chains
+  the settled target currently installed at 0x4D0484. Mirror happens before that renderer;
+  the standalone second weapon is rendered after it returns. If another ASI replaces the
+  call later, v7 logs it and does not chase the new hook (avoids recursive hook cycles).
+- The second weapon atomic remains private/outside the ped clump. This is the v6 crash fix.
+- Skin & Bones' exported IIIAnimGetPedWeaponAtomic is used when available to confirm the
+  native/right weapon exists, but generic HAnim detection does not require the export.
+- The second muzzle is still derived from the actual private twin-weapon frame and passed
+  through native CWeapon::Fire, so GTA III owns flash/smoke/light/shell effects.
+- Vehicle enter/exit, driving/passenger, fall/get-up/death and other unsafe states suppress
+  the twin pose/weapon to avoid fighting ragdoll/vehicle animation ownership.
+
+Runtime log:
+  DualWieldIII_v7_V3Baseline_SkinBonesCompat.log
+
+Useful expected lines on the Skin & Bones install:
+  Skin & Bones iii_anim detected ...
+  skinned ped path active; HAnim=... nodes=...
+  render bridge active. previous=... [CHAINED]
+  v3 render-stage mirror active mode=Skin&Bones/HAnim ...
+
+If creation is deferred, the log reports the active weapon, m_nWepModelID, CWeaponInfo
+model ID, HAnim hierarchy, and Skin & Bones native weapon pointer so the remaining gate is
+visible instead of guessed.
