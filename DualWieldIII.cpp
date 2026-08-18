@@ -1,10 +1,26 @@
 /*
-    DualWieldIII
-    Dual-wield backport for classic GTA III 1.0 EN.
+    DualWieldIII v21 - VCStyleSymmetricAim
+    GTA III 1.0 EN dual-wield backport for the one-handed firearms.
 
-    The second weapon is a standalone RpAtomic kept outside the player ped clump.
-    Stock PC RwFrame and Skin & Bones/Xbox HAnim skeletons use separate pose paths.
-    Colt .45/Uzi second shots use GTA III's native CWeapon::Fire path.
+    The v15 movement/aim continuity fix remains authoritative: the movement-originated
+    ClearAimFlag call at 0x4C5BF3 is suppressed only while target/fire intent is held,
+    preventing forward locomotion from alternating the native gun arm with vanilla walk.
+
+    v17 full-pitch behavior is also retained: a native pose is accepted because GTA
+    actually ran CPed::AimGun, not because the weapon hand passed an arbitrary height test.
+
+    v19's coherent local-HAnim controller and v15 aim-continuity path remain intact.
+    v21 changes only the arm target geometry to match the newer Vice City implementation:
+    mirror the finished native shoulder->elbow and elbow->hand segment directions across
+    Claude's sagittal plane, then solve those directions through the opposite arm's LOCAL
+    HAnim quaternions. This removes v20's mistake of copying the native arm direction
+    unchanged onto the opposite shoulder, which preserves the wrong lateral component and
+    makes the twin arm curl inward/cross-body instead of aiming straight ahead symmetrically.
+
+    The second gun socket remains deterministic. On Skin & Bones peds, its constant
+    opposite-hand grip correction is derived from the skin's own inverse bind matrices
+    (RpSkinGetSkinToBoneMatrices, GTA III 1.0 EN 0x5B10D0). The correction is therefore
+    skeleton-relative and cannot switch among 180-degree candidates while firing.
 */
 
 #define WIN32_LEAN_AND_MEAN
@@ -25,6 +41,7 @@
 #include "CWeaponInfo.h"
 #include "CModelInfo.h"
 #include "CTimer.h"
+#include "CPad.h"
 
 using namespace plugin;
 
@@ -33,22 +50,32 @@ extern "C" IMAGE_DOS_HEADER __ImageBase;
 namespace DualWieldIII {
 
     static const uintptr_t ADDR_ATTACK_FIRE_CALL = 0x4E6EBF;
-    static const uintptr_t ADDR_WEAPON_FIRE       = 0x55C380;
-    static const uintptr_t ADDR_PED_RENDER_CALL  = 0x4D0484;
-    static const uintptr_t ADDR_ENTITY_RENDER      = 0x474BD0;
+    static const uintptr_t ADDR_WEAPON_FIRE = 0x55C380;
+    static const uintptr_t ADDR_PED_AIMGUN_CALL = 0x4CB037;
+    static const uintptr_t ADDR_PED_AIMGUN = 0x4C6AA0;
+    static const uintptr_t ADDR_MOVE_CLEAR_AIM_CALL = 0x4C5BF3;
+    static const uintptr_t ADDR_PED_CLEAR_AIM = 0x4C6A50;
+    static const uintptr_t ADDR_PED_RENDER_CALL = 0x4D0484;
+    static const uintptr_t ADDR_ENTITY_RENDER = 0x474BD0;
+    static const uintptr_t ADDR_ANIMBLEND_FIND_FRAME = 0x405430;
+    static const uintptr_t ADDR_SKIN_GET_SKIN_TO_BONE_MATRICES = 0x5B10D0;
 
-    typedef bool (__thiscall *WeaponFireFn)(CWeapon*, CEntity*, CVector*);
-    typedef void (__thiscall *PedRenderCallFn)(CPed*);
-    typedef RpAtomic* (__cdecl *SkinBonesGetPedWeaponAtomicFn)(CPed*);
+    typedef bool(__thiscall* WeaponFireFn)(CWeapon*, CEntity*, CVector*);
+    typedef void(__thiscall* PedAimGunFn)(CPed*);
+    typedef void(__thiscall* PedClearAimFn)(CPed*);
+    typedef void(__thiscall* PedRenderCallFn)(CPed*);
+    typedef void* (__cdecl* AnimBlendFindFrameFn)(RpClump*, const char*);
+    typedef RpAtomic* (__cdecl* SkinBonesGetPedWeaponAtomicFn)(CPed*);
+    typedef RwMatrix* (__cdecl* SkinGetSkinToBoneMatricesFn)(RpSkin*);
 
     enum SkinBoneTag {
-        BONE_SWAIST      = 0,
-        BONE_SUPPERARMR  = 10,
-        BONE_SLOWERARMR  = 11,
-        BONE_SRHAND      = 12,
-        BONE_SUPPERARML  = 13,
-        BONE_SLOWERARML  = 14,
-        BONE_SLHAND      = 15
+        BONE_SWAIST = 0,
+        BONE_SUPPERARMR = 10,
+        BONE_SLOWERARMR = 11,
+        BONE_SRHAND = 12,
+        BONE_SUPPERARML = 13,
+        BONE_SLOWERARML = 14,
+        BONE_SLHAND = 15
     };
 
     struct Config {
@@ -58,8 +85,22 @@ namespace DualWieldIII {
         bool doubleShot;
         bool leftArmIK;
         bool chainExistingCallHooks;
-        int aimGraceFrames;
         int aimBlendFrames;
+        int aimHoldFrames;
+        float aimPoseBlend;
+        float firePoseBlend;
+        bool lateProcessRepair;
+        bool stabilizeSecondHand;
+        float handAimBlend;
+        float handAimLimitDeg;
+        bool stabilizeSecondHandRoll;
+        float handRollBlend;
+        float handRollLimitDeg;
+        bool copyNativeGripBasis;
+        float armReachScale;
+        float elbowOutwardDeg;
+        bool logHandState;
+        int handStateLogInterval;
         float offsetX;
         float offsetY;
         float offsetZ;
@@ -69,9 +110,16 @@ namespace DualWieldIII {
 
         Config()
             : enabled(true), colt45(true), uzi(true), doubleShot(true), leftArmIK(true),
-              chainExistingCallHooks(true), aimGraceFrames(2), aimBlendFrames(3),
-              offsetX(0.04f), offsetY(-0.05f), offsetZ(0.0f),
-              rotX(180.0f), rotY(0.0f), rotZ(0.0f) {}
+            chainExistingCallHooks(true), aimBlendFrames(1), aimHoldFrames(4),
+            aimPoseBlend(1.0f), firePoseBlend(1.0f),
+            lateProcessRepair(false), stabilizeSecondHand(true),
+            handAimBlend(1.0f), handAimLimitDeg(90.0f),
+            stabilizeSecondHandRoll(true), handRollBlend(1.0f), handRollLimitDeg(90.0f),
+            copyNativeGripBasis(true), armReachScale(0.92f), elbowOutwardDeg(0.0f),
+            logHandState(false), handStateLogInterval(60),
+            offsetX(0.0f), offsetY(0.0f), offsetZ(0.0f),
+            rotX(0.0f), rotY(0.0f), rotZ(0.0f) {
+        }
     };
 
     struct LeftWeaponRuntime {
@@ -85,7 +133,8 @@ namespace DualWieldIII {
         eWeaponType weaponType;
 
         LeftWeaponRuntime()
-            : owner(0), ownerClump(0), atomic(0), helperFrame(0), sourceHandFrame(0), skinnedSource(false), modelId(-1), weaponType(WEAPONTYPE_UNARMED) {}
+            : owner(0), ownerClump(0), atomic(0), helperFrame(0), sourceHandFrame(0), skinnedSource(false), modelId(-1), weaponType(WEAPONTYPE_UNARMED) {
+        }
     };
 
     struct CallPatch {
@@ -98,23 +147,145 @@ namespace DualWieldIII {
 
         CallPatch()
             : address(0), previousTarget(0), hookTarget(0), originalRel(0),
-              installed(false), chained(false) {}
+            installed(false), chained(false) {
+        }
+    };
+
+
+    static const int PED_FRAME_SECOND_UPPER = 3;
+    static const int PED_FRAME_NATIVE_UPPER = 4;
+    static const int PED_FRAME_SECOND_HAND = 5;
+    static const int PED_FRAME_NATIVE_HAND = 6;
+
+    enum DualWieldPose {
+        DUALPOSE_IDLE = 0,
+        DUALPOSE_AIMING,
+        DUALPOSE_FIRING,
+        DUALPOSE_RELOADING,
+        DUALPOSE_LOWERING
+    };
+
+    struct HandSnapshot {
+        bool handValid;
+        bool weaponValid;
+        bool muzzleValid;
+        RwMatrix handWorld;
+        RwMatrix weaponWorld;
+        CVector handPosition;
+        CVector muzzle;
+
+        void Reset() {
+            handValid = false;
+            weaponValid = false;
+            muzzleValid = false;
+            std::memset(&handWorld, 0, sizeof(handWorld));
+            std::memset(&weaponWorld, 0, sizeof(weaponWorld));
+            handPosition = CVector(0.0f, 0.0f, 0.0f);
+            muzzle = CVector(0.0f, 0.0f, 0.0f);
+        }
+    };
+
+    struct DualWieldState {
+        CPed* owner;
+        unsigned int frame;
+        eWeaponType weaponType;
+        DualWieldPose pose;
+        bool active;
+        bool skinned;
+        bool reloading;
+        bool fireRightThisFrame;
+        bool fireLeftThisFrame;
+        float aimBlend;
+        HandSnapshot nativeHand;
+        HandSnapshot secondHand;
+
+        void Reset() {
+            owner = 0;
+            frame = 0;
+            weaponType = WEAPONTYPE_UNARMED;
+            pose = DUALPOSE_IDLE;
+            active = false;
+            skinned = false;
+            reloading = false;
+            fireRightThisFrame = false;
+            fireLeftThisFrame = false;
+            aimBlend = 0.0f;
+            nativeHand.Reset();
+            secondHand.Reset();
+        }
     };
 
     static Config gConfig;
     static LeftWeaponRuntime gLeft;
     static CallPatch gFirePatch;
+    static CallPatch gAimPatch;
+    static CallPatch gMoveClearAimPatch;
     static CallPatch gRenderPatch;
+    static DualWieldState gDualState;
     static char gIniPath[MAX_PATH] = {};
     static char gLogPath[MAX_PATH] = {};
-    static int gAimGraceFramesRemaining = 0;
+    static bool gLoggedFirstPostAimPose = false;
+    static bool gLoggedFirstLateRepairPose = false;
+    static unsigned int gPostAimPoseHits = 0;
+    static unsigned int gLateRepairPoseHits = 0;
+    static unsigned int gRenderMirrorHits = 0;
+    static unsigned int gLastPostAimPoseFrame = 0xFFFFFFFFu;
+    static unsigned int gLastLateRepairPoseFrame = 0xFFFFFFFFu;
+    static unsigned int gSecondShotAttempts = 0;
+    static unsigned int gSecondShotSuccess = 0;
+    static bool gLoggedFirstSecondShot = false;
+    static bool gLoggedClumpReplacement = false;
+    static bool gLoggedRuntimeSummary = false;
     static HMODULE gSkinBonesModule = 0;
     static SkinBonesGetPedWeaponAtomicFn gSkinBonesGetPedWeaponAtomic = 0;
     static bool gSkinBonesProbeDone = false;
     static bool gLoggedSkinBonesDetected = false;
+    static bool gLoggedSkinnedPedMode = false;
+    static bool gLoggedAimRechain = false;
+    static bool gLoggedAimInstallFailure = false;
     static bool gLoggedRenderRechain = false;
+    static bool gLoggedCreateFailure = false;
+    static unsigned int gCreateFailureFrame = 0;
+    static unsigned int gLastHandStateLogFrame = 0;
     static float gAimBlend = 0.0f;
     static unsigned int gAimBlendFrame = 0xFFFFFFFFu;
+
+    struct StableNativeAimPose {
+        bool valid;
+        CPed* owner;
+        RpClump* clump;
+        eWeaponType weaponType;
+        unsigned int frame;
+        RwMatrix waist;
+        RwMatrix upper;
+        RwMatrix lower;
+        RwMatrix hand;
+
+        StableNativeAimPose()
+            : valid(false), owner(0), clump(0), weaponType(WEAPONTYPE_UNARMED), frame(0) {
+            std::memset(&waist, 0, sizeof(waist));
+            std::memset(&upper, 0, sizeof(upper));
+            std::memset(&lower, 0, sizeof(lower));
+            std::memset(&hand, 0, sizeof(hand));
+        }
+    };
+
+    static StableNativeAimPose gStableNativeAimPose;
+    static unsigned int gLastNativeAimGunFrame = 0xFFFFFFFFu;
+    static unsigned int gAimIntentEvalFrame = 0xFFFFFFFFu;
+    static int gAimIntentHoldRemaining = 0;
+    static bool gAimIntentLatched = false;
+    static bool gPoseNativeHandBasisValid = false;
+    static RwMatrix gPoseNativeHandBasis;
+    // v16: while the render/fire transaction owns the twin arm, the weapon is
+    // attached to this exact solved hand matrix. This prevents the gun basis from
+    // being updated independently of the hand and removes the loose/floating look.
+    static bool gSolvedSecondHandGripValid = false;
+    static RwMatrix gSolvedSecondHandGrip;
+    // v19 grip correction is derived from the actual skinned skeleton bind pose.
+    // There is no animation-dependent 180-degree socket chooser anymore.
+    static unsigned int gMoveAimClearSuppressions = 0;
+    static unsigned int gCachedAimPoseUses = 0;
 
     static void BuildSiblingPath(char* out, size_t outSize, const char* filename) {
         if (!out || outSize == 0)
@@ -163,24 +334,56 @@ namespace DualWieldIII {
     }
 
     static void LoadConfig() {
-        gConfig.enabled    = ReadBool("Enabled", true);
-        gConfig.colt45     = ReadBool("Colt45", true);
-        gConfig.uzi        = ReadBool("Uzi", true);
+        gConfig.enabled = ReadBool("Enabled", true);
+        gConfig.colt45 = ReadBool("Colt45", true);
+        gConfig.uzi = ReadBool("Uzi", true);
         gConfig.doubleShot = ReadBool("DoubleShot", true);
-        gConfig.leftArmIK  = ReadBool("LeftArmIK", true);
+        gConfig.leftArmIK = ReadBool("LeftArmIK", true);
         gConfig.chainExistingCallHooks = ReadBool("ChainExistingCallHooks", true);
-        gConfig.aimGraceFrames = static_cast<int>(GetPrivateProfileIntA("DualWield", "AimGraceFrames", 2, gIniPath));
-        if (gConfig.aimGraceFrames < 0) gConfig.aimGraceFrames = 0;
-        if (gConfig.aimGraceFrames > 8) gConfig.aimGraceFrames = 8;
-        gConfig.aimBlendFrames = static_cast<int>(GetPrivateProfileIntA("DualWield", "AimBlendFrames", 3, gIniPath));
+        gConfig.aimBlendFrames = static_cast<int>(GetPrivateProfileIntA("DualWield", "AimBlendFrames", 1, gIniPath));
         if (gConfig.aimBlendFrames < 0) gConfig.aimBlendFrames = 0;
         if (gConfig.aimBlendFrames > 8) gConfig.aimBlendFrames = 8;
-        gConfig.offsetX    = ReadFloat("OffsetX", 0.04f);
-        gConfig.offsetY    = ReadFloat("OffsetY", -0.05f);
-        gConfig.offsetZ    = ReadFloat("OffsetZ", 0.0f);
-        gConfig.rotX       = ReadFloat("RotationX", 180.0f);
-        gConfig.rotY       = ReadFloat("RotationY", 0.0f);
-        gConfig.rotZ       = ReadFloat("RotationZ", 0.0f);
+        gConfig.aimHoldFrames = static_cast<int>(GetPrivateProfileIntA("DualWield", "AimHoldFrames", 4, gIniPath));
+        if (gConfig.aimHoldFrames < 1) gConfig.aimHoldFrames = 1;
+        if (gConfig.aimHoldFrames > 12) gConfig.aimHoldFrames = 12;
+        gConfig.aimPoseBlend = ReadFloat("AimPoseBlend", 1.0f);
+        if (gConfig.aimPoseBlend < 0.0f) gConfig.aimPoseBlend = 0.0f;
+        if (gConfig.aimPoseBlend > 1.0f) gConfig.aimPoseBlend = 1.0f;
+        gConfig.firePoseBlend = ReadFloat("FirePoseBlend", 1.0f);
+        if (gConfig.firePoseBlend < 0.0f) gConfig.firePoseBlend = 0.0f;
+        if (gConfig.firePoseBlend > 1.0f) gConfig.firePoseBlend = 1.0f;
+        gConfig.lateProcessRepair = ReadBool("LateProcessRepair", false);
+        gConfig.stabilizeSecondHand = ReadBool("StabilizeSecondHand", true);
+        gConfig.handAimBlend = ReadFloat("HandAimBlend", 1.0f);
+        if (gConfig.handAimBlend < 0.0f) gConfig.handAimBlend = 0.0f;
+        if (gConfig.handAimBlend > 1.0f) gConfig.handAimBlend = 1.0f;
+        gConfig.handAimLimitDeg = ReadFloat("HandAimLimitDeg", 90.0f);
+        if (gConfig.handAimLimitDeg < 0.0f) gConfig.handAimLimitDeg = 0.0f;
+        if (gConfig.handAimLimitDeg > 180.0f) gConfig.handAimLimitDeg = 180.0f;
+        gConfig.stabilizeSecondHandRoll = ReadBool("StabilizeSecondHandRoll", true);
+        gConfig.handRollBlend = ReadFloat("HandRollBlend", 1.0f);
+        if (gConfig.handRollBlend < 0.0f) gConfig.handRollBlend = 0.0f;
+        if (gConfig.handRollBlend > 1.0f) gConfig.handRollBlend = 1.0f;
+        gConfig.handRollLimitDeg = ReadFloat("HandRollLimitDeg", 90.0f);
+        if (gConfig.handRollLimitDeg < 0.0f) gConfig.handRollLimitDeg = 0.0f;
+        if (gConfig.handRollLimitDeg > 180.0f) gConfig.handRollLimitDeg = 180.0f;
+        gConfig.copyNativeGripBasis = ReadBool("CopyNativeGripBasis", true);
+        gConfig.armReachScale = ReadFloat("ArmReachScale", 0.92f);
+        if (gConfig.armReachScale < 0.70f) gConfig.armReachScale = 0.70f;
+        if (gConfig.armReachScale > 1.00f) gConfig.armReachScale = 1.00f;
+        gConfig.elbowOutwardDeg = ReadFloat("ElbowOutwardDeg", 0.0f);
+        if (gConfig.elbowOutwardDeg < 0.0f) gConfig.elbowOutwardDeg = 0.0f;
+        if (gConfig.elbowOutwardDeg > 15.0f) gConfig.elbowOutwardDeg = 15.0f;
+        gConfig.logHandState = ReadBool("LogHandState", false);
+        gConfig.handStateLogInterval = static_cast<int>(GetPrivateProfileIntA("DualWield", "HandStateLogInterval", 60, gIniPath));
+        if (gConfig.handStateLogInterval < 1) gConfig.handStateLogInterval = 1;
+        if (gConfig.handStateLogInterval > 600) gConfig.handStateLogInterval = 600;
+        gConfig.offsetX = ReadFloat("OffsetX", 0.0f);
+        gConfig.offsetY = ReadFloat("OffsetY", 0.0f);
+        gConfig.offsetZ = ReadFloat("OffsetZ", 0.0f);
+        gConfig.rotX = ReadFloat("RotationX", 0.0f);
+        gConfig.rotY = ReadFloat("RotationY", 0.0f);
+        gConfig.rotZ = ReadFloat("RotationZ", 0.0f);
     }
 
     static bool IsDualWeapon(eWeaponType type) {
@@ -202,7 +405,7 @@ namespace DualWieldIII {
         if (!ped || ped->m_bInVehicle)
             return true;
 
-        // Explicit physical/animation ownership flags. Keep our render-stage arm edit
+        // Explicit physical/animation ownership flags. Keep our post-AimGun arm correction
         // away from falling/get-up/death transitions where a ragdoll system is likely
         // to own the same frames. Do not use bDontAcceptIKLookAts here: that flag is
         // about look-at IK and is not a reliable generic ragdoll signal.
@@ -262,12 +465,12 @@ namespace DualWieldIII {
         // that union member is an HAnim interpolation frame pointer instead. Only require
         // sourceHandFrame for the stock non-skinned path.
         return ped && gLeft.owner == ped && gLeft.ownerClump && gLeft.atomic &&
-               gLeft.helperFrame && (gLeft.skinnedSource || gLeft.sourceHandFrame) &&
-               ped->m_pRwClump == gLeft.ownerClump;
+            gLeft.helperFrame && (gLeft.skinnedSource || gLeft.sourceHandFrame) &&
+            ped->m_pRwClump == gLeft.ownerClump;
     }
 
     static void DestroyLeftWeapon() {
-        // The atomic and helper frame are owned independently by this ASI. The atomic is deliberately NOT
+        // DualWieldIII owns both of these objects independently. The atomic is deliberately NOT
         // in the player's clump, so cleanup never calls RpClumpRemoveAtomic and remains
         // safe even if a skin/ragdoll mod replaced the player's clump this frame.
         if (gLeft.atomic) {
@@ -279,9 +482,9 @@ namespace DualWieldIII {
             gLeft.helperFrame = 0;
         }
         gLeft = LeftWeaponRuntime();
-        gAimGraceFramesRemaining = 0;
         gAimBlend = 0.0f;
         gAimBlendFrame = 0xFFFFFFFFu;
+        gDualState.Reset();
     }
 
     static bool IsFiniteFloat(float v) {
@@ -298,7 +501,7 @@ namespace DualWieldIII {
 
     static bool IsFiniteRwMatrix(const RwMatrix& m) {
         return IsFiniteRwVector(m.right) && IsFiniteRwVector(m.up) &&
-               IsFiniteRwVector(m.at) && IsFiniteRwVector(m.pos);
+            IsFiniteRwVector(m.at) && IsFiniteRwVector(m.pos);
     }
 
     static bool IsReadableAddress(const void* ptr, size_t bytes = sizeof(void*)) {
@@ -319,6 +522,81 @@ namespace DualWieldIII {
     static bool IsFrameReadable(RwFrame* frame) {
         // We only need enough of RwFrame to safely use its object/parent/modelling fields.
         return IsReadableAddress(frame, 0x50);
+    }
+
+
+    static void* FindAnimBlendFrameDataRaw(CPed* ped, const char* name) {
+        if (!ped || !ped->m_pRwClump || !name || !name[0])
+            return 0;
+        if (!IsReadableAddress(reinterpret_cast<const void*>(ADDR_ANIMBLEND_FIND_FRAME), 5))
+            return 0;
+
+        // GTA III 1.0 EN: RpAnimBlendClumpFindFrame = 0x405430. Skin & Bones replaces
+        // this same entry point with a skinned-aware implementation, so calling the
+        // settled game address works for both the stock RwFrame and Xbox/HAnim paths.
+        AnimBlendFindFrameFn findFrame = reinterpret_cast<AnimBlendFindFrameFn>(ADDR_ANIMBLEND_FIND_FRAME);
+        void* frameData = findFrame(ped->m_pRwClump, name);
+        return IsReadableAddress(frameData, 1) ? frameData : 0;
+    }
+
+    static unsigned char* FrameRotationFlags(void* frameData) {
+        return IsReadableAddress(frameData, 1)
+            ? reinterpret_cast<unsigned char*>(frameData) : 0;
+    }
+
+    static bool RawAimIntent(CPed* ped) {
+        if (!gConfig.leftArmIK || !IsEligiblePlayer(ped))
+            return false;
+        CWeapon* weapon = ped->GetWeapon();
+        if (!weapon || weapon->m_eWeaponState == WEAPONSTATE_RELOADING ||
+            weapon->m_eWeaponState == WEAPONSTATE_OUT_OF_AMMO)
+            return false;
+
+        bool padAim = false;
+        CPad* pad = CPad::GetPad(0);
+        if (pad)
+            padAim = pad->GetTarget() || pad->GetWeapon();
+
+        return padAim || ped->bIsAimingGun || ped->bIsPointingGunAt || ped->bIsShooting ||
+            weapon->m_eWeaponState == WEAPONSTATE_FIRING ||
+            ped->m_ePedState == PEDSTATE_AIMGUN || ped->m_ePedState == PEDSTATE_ATTACK;
+    }
+
+    static bool ContinuousAimIntent(CPed* ped) {
+        if (!ped || !IsEligiblePlayer(ped)) {
+            gAimIntentHoldRemaining = 0;
+            gAimIntentLatched = false;
+            return false;
+        }
+
+        CWeapon* weapon = ped->GetWeapon();
+        if (!weapon || weapon->m_eWeaponState == WEAPONSTATE_RELOADING ||
+            weapon->m_eWeaponState == WEAPONSTATE_OUT_OF_AMMO) {
+            gAimIntentHoldRemaining = 0;
+            gAimIntentLatched = false;
+            return false;
+        }
+
+        const unsigned int frame = CTimer::m_FrameCounter;
+        if (frame != gAimIntentEvalFrame) {
+            gAimIntentEvalFrame = frame;
+            if (RawAimIntent(ped)) {
+                gAimIntentHoldRemaining = gConfig.aimHoldFrames;
+                gAimIntentLatched = true;
+            }
+            else if (gAimIntentHoldRemaining > 0) {
+                --gAimIntentHoldRemaining;
+                gAimIntentLatched = true;
+            }
+            else {
+                gAimIntentLatched = false;
+            }
+        }
+        return gAimIntentLatched;
+    }
+
+    static bool WantsSecondArmPose(CPed* ped) {
+        return ContinuousAimIntent(ped);
     }
 
     static void ResolveSkinBonesApi() {
@@ -352,8 +630,9 @@ namespace DualWieldIII {
 
     struct SkinProbe {
         RpAtomic* atomic;
+        RpSkin* skin;
         RpHAnimHierarchy* hierarchy;
-        SkinProbe() : atomic(0), hierarchy(0) {}
+        SkinProbe() : atomic(0), skin(0), hierarchy(0) {}
     };
 
     static RpAtomic* FindSkinnedAtomicCB(RpAtomic* atomic, void* data) {
@@ -372,18 +651,20 @@ namespace DualWieldIII {
             return atomic;
 
         probe->atomic = atomic;
+        probe->skin = skin;
         probe->hierarchy = hierarchy;
         return 0; // stop once the actual skinned body atomic is found
     }
 
-    static bool GetSkinnedPedHierarchy(CPed* ped, RpHAnimHierarchy*& hierarchy) {
+    static bool GetSkinnedPedSkinHierarchy(CPed* ped, RpSkin*& skin, RpHAnimHierarchy*& hierarchy) {
+        skin = 0;
         hierarchy = 0;
         if (!ped || !ped->m_pRwClump)
             return false;
 
         SkinProbe probe;
         RpClumpForAllAtomics(ped->m_pRwClump, FindSkinnedAtomicCB, &probe);
-        if (!probe.atomic || !probe.hierarchy)
+        if (!probe.atomic || !probe.skin || !probe.hierarchy)
             return false;
 
         RpHAnimHierarchy* h = probe.hierarchy;
@@ -395,8 +676,14 @@ namespace DualWieldIII {
             !IsReadableAddress(h->pNodeInfo, sizeof(RpHAnimNodeInfo) * static_cast<size_t>(h->numNodes)))
             return false;
 
+        skin = probe.skin;
         hierarchy = h;
         return true;
+    }
+
+    static bool GetSkinnedPedHierarchy(CPed* ped, RpHAnimHierarchy*& hierarchy) {
+        RpSkin* skin = 0;
+        return GetSkinnedPedSkinHierarchy(ped, skin, hierarchy);
     }
 
     static bool IsSkinnedPed(CPed* ped) {
@@ -504,7 +791,7 @@ namespace DualWieldIII {
 
         // Weapon-local -> grip correction -> hand world. The helper is a private root,
         // so its modelling matrix is already world-space. This is the same composition
-        // Only the source of handWorld differs for stock vs skinned peds.
+        // used by v3; only the source of handWorld differs for stock vs skinned peds.
         RwMatrix weaponWorld;
         BuildGripCorrection(weaponWorld);
         RwMatrixTransform(&weaponWorld, &handWorld, rwCOMBINEPOSTCONCAT);
@@ -528,16 +815,49 @@ namespace DualWieldIII {
         return PutWeaponFrameOnWorldMatrix(helperFrame, handWorld);
     }
 
+    static float DotRwAxis(const RwV3d& a, const RwV3d& b) {
+        return a.x * b.x + a.y * b.y + a.z * b.z;
+    }
+
+    static void CopyAxisSigned(RwV3d& dst, const RwV3d& src, float sign) {
+        dst.x = src.x * sign;
+        dst.y = src.y * sign;
+        dst.z = src.z * sign;
+    }
+
+    static bool BuildOppositeGripWorld(
+        CPed* ped,
+        RpHAnimHierarchy* hierarchy,
+        const RwMatrix& nativeHand,
+        const RwMatrix& secondHand,
+        RwMatrix& out);
+
     static bool PutWeaponFrameOnSkinnedHand(CPed* ped, RwFrame* helperFrame) {
         if (!ped || !helperFrame)
             return false;
         RpHAnimHierarchy* hierarchy = 0;
         if (!GetSkinnedPedHierarchy(ped, hierarchy))
             return false;
-        RwMatrix* hand = GetSkinBoneMatrix(hierarchy, BONE_SLHAND);
-        if (!hand)
+        RwMatrix* secondHand = GetSkinBoneMatrix(hierarchy, BONE_SLHAND);
+        if (!secondHand)
             return false;
-        return PutWeaponFrameOnWorldMatrix(helperFrame, *hand);
+
+        // During the v19 transactional firing/render pose, gSolvedSecondHandGrip is a
+        // frozen bind-corrected socket matrix built from the coherently rebuilt SLhand.
+        // Use it as the single authority for the visible gun until the transaction ends.
+        if (gSolvedSecondHandGripValid && IsFiniteRwMatrix(gSolvedSecondHandGrip))
+            return PutWeaponFrameOnWorldMatrix(helperFrame, gSolvedSecondHandGrip);
+
+        if (!gConfig.copyNativeGripBasis)
+            return PutWeaponFrameOnWorldMatrix(helperFrame, *secondHand);
+        RwMatrix* nativeHand = GetSkinBoneMatrix(hierarchy, BONE_SRHAND);
+        const RwMatrix* nativeGripBasis = gPoseNativeHandBasisValid ? &gPoseNativeHandBasis : nativeHand;
+        if (!nativeGripBasis)
+            return false;
+        RwMatrix gripWorld;
+        if (!BuildOppositeGripWorld(ped, hierarchy, *nativeGripBasis, *secondHand, gripWorld))
+            return false;
+        return PutWeaponFrameOnWorldMatrix(helperFrame, gripWorld);
     }
 
     static bool UpdateLeftWeaponWorldTransform() {
@@ -547,7 +867,162 @@ namespace DualWieldIII {
             return PutWeaponFrameOnSkinnedHand(gLeft.owner, gLeft.helperFrame);
         if (!gLeft.sourceHandFrame)
             return false;
-        return PutWeaponFrameOnHand(gLeft.helperFrame, gLeft.sourceHandFrame);
+        if (!gConfig.copyNativeGripBasis)
+            return PutWeaponFrameOnHand(gLeft.helperFrame, gLeft.sourceHandFrame);
+
+        RwFrame* nativeFrame = GetPedFrameSafe(gLeft.owner, PED_FRAME_NATIVE_HAND);
+        if (!nativeFrame)
+            return false;
+        RwMatrix nativeHand, secondHand, gripWorld;
+        if (!GetFrameWorldMatrixManual(nativeFrame, nativeHand) ||
+            !GetFrameWorldMatrixManual(gLeft.sourceHandFrame, secondHand) ||
+            !BuildOppositeGripWorld(gLeft.owner, 0, nativeHand, secondHand, gripWorld))
+            return false;
+        return PutWeaponFrameOnWorldMatrix(gLeft.helperFrame, gripWorld);
+    }
+
+
+    static bool ComputeWeaponWorldFromHand(const RwMatrix& handWorld, RwMatrix& weaponWorld) {
+        BuildGripCorrection(weaponWorld);
+        RwMatrixTransform(&weaponWorld, &handWorld, rwCOMBINEPOSTCONCAT);
+        return IsFiniteRwMatrix(weaponWorld);
+    }
+
+    static bool ComputeMuzzleFromWeaponWorld(CWeaponInfo* info, const RwMatrix& weaponWorld, CVector& out) {
+        if (!info || !IsFiniteRwMatrix(weaponWorld))
+            return false;
+        RwV3d src = { info->m_vecFireOffset.x, info->m_vecFireOffset.y, info->m_vecFireOffset.z };
+        RwV3d dst = {};
+        RwV3dTransformPoints(&dst, &src, 1, const_cast<RwMatrix*>(&weaponWorld));
+        out.x = dst.x;
+        out.y = dst.y;
+        out.z = dst.z;
+        return IsFiniteVector(out);
+    }
+
+    static void FillHandSnapshotFromMatrix(HandSnapshot& hand, const RwMatrix& handWorld, CWeaponInfo* info, bool makeWeapon) {
+        hand.Reset();
+        if (!IsFiniteRwMatrix(handWorld))
+            return;
+        hand.handWorld = handWorld;
+        hand.handPosition.x = handWorld.pos.x;
+        hand.handPosition.y = handWorld.pos.y;
+        hand.handPosition.z = handWorld.pos.z;
+        hand.handValid = IsFiniteVector(hand.handPosition);
+        if (makeWeapon && info && ComputeWeaponWorldFromHand(handWorld, hand.weaponWorld)) {
+            hand.weaponValid = true;
+            hand.muzzleValid = ComputeMuzzleFromWeaponWorld(info, hand.weaponWorld, hand.muzzle);
+        }
+    }
+
+    static bool CaptureStockHandMatrix(CPed* ped, int frameIndex, RwMatrix& out) {
+        RwFrame* frame = GetPedFrameSafe(ped, frameIndex);
+        return frame && GetFrameWorldMatrixManual(frame, out);
+    }
+
+    static bool CaptureSkinnedHandMatrix(CPed* ped, int boneId, RwMatrix& out) {
+        RpHAnimHierarchy* hierarchy = 0;
+        if (!GetSkinnedPedHierarchy(ped, hierarchy))
+            return false;
+        RwMatrix* m = GetSkinBoneMatrix(hierarchy, boneId);
+        if (!m)
+            return false;
+        out = *m;
+        return IsFiniteRwMatrix(out);
+    }
+
+    static bool IsMuzzleSaneForPed(CPed* ped, const CVector& muzzle) {
+        if (!ped || !IsFiniteVector(muzzle))
+            return false;
+        const CVector& pedPos = ped->GetPosition();
+        const float dx = muzzle.x - pedPos.x;
+        const float dy = muzzle.y - pedPos.y;
+        const float dz = muzzle.z - pedPos.z;
+        const float distSq = dx * dx + dy * dy + dz * dz;
+        return IsFiniteFloat(distSq) && distSq <= 9.0f;
+    }
+
+    static bool UpdateDualWieldState(CPed* ped, CWeapon* weapon, const CVector* nativeMuzzle, bool refreshSecondWeapon) {
+        gDualState.Reset();
+        if (!ped || !weapon || !IsEligiblePlayer(ped, weapon))
+            return false;
+
+        CWeaponInfo* info = CWeaponInfo::GetWeaponInfo(weapon->m_eWeaponType);
+        if (!info)
+            return false;
+
+        gDualState.owner = ped;
+        gDualState.frame = CTimer::m_FrameCounter;
+        gDualState.weaponType = weapon->m_eWeaponType;
+        gDualState.active = true;
+        gDualState.reloading = weapon->m_eWeaponState == WEAPONSTATE_RELOADING;
+        gDualState.skinned = IsSkinnedPed(ped);
+        gDualState.aimBlend = gAimBlend;
+        gDualState.pose = gDualState.reloading ? DUALPOSE_RELOADING :
+            (ped->bIsShooting || ped->m_ePedState == PEDSTATE_ATTACK ? DUALPOSE_FIRING :
+                (gAimBlend > 0.05f ? DUALPOSE_AIMING : DUALPOSE_IDLE));
+
+        RwMatrix nativeHand;
+        if (gDualState.skinned) {
+            if (CaptureSkinnedHandMatrix(ped, BONE_SRHAND, nativeHand))
+                FillHandSnapshotFromMatrix(gDualState.nativeHand, nativeHand, info, false);
+        }
+        else {
+            if (CaptureStockHandMatrix(ped, PED_FRAME_NATIVE_HAND, nativeHand))
+                FillHandSnapshotFromMatrix(gDualState.nativeHand, nativeHand, info, false);
+        }
+        if (nativeMuzzle && IsFiniteVector(*nativeMuzzle)) {
+            gDualState.nativeHand.muzzle = *nativeMuzzle;
+            gDualState.nativeHand.muzzleValid = true;
+        }
+
+        if (refreshSecondWeapon && !UpdateLeftWeaponWorldTransform())
+            return false;
+        if (gLeft.owner == ped && gLeft.helperFrame) {
+            RwMatrix* secondWeapon = RwFrameGetMatrix(gLeft.helperFrame);
+            if (secondWeapon && IsFiniteRwMatrix(*secondWeapon)) {
+                gDualState.secondHand.weaponWorld = *secondWeapon;
+                gDualState.secondHand.weaponValid = true;
+                gDualState.secondHand.muzzleValid = ComputeMuzzleFromWeaponWorld(info, *secondWeapon, gDualState.secondHand.muzzle) &&
+                    IsMuzzleSaneForPed(ped, gDualState.secondHand.muzzle);
+            }
+
+            RwMatrix secondHand;
+            bool gotSecondHand = false;
+            if (gLeft.skinnedSource)
+                gotSecondHand = CaptureSkinnedHandMatrix(ped, BONE_SLHAND, secondHand);
+            else
+                gotSecondHand = CaptureStockHandMatrix(ped, PED_FRAME_SECOND_HAND, secondHand);
+            if (gotSecondHand) {
+                gDualState.secondHand.handWorld = secondHand;
+                gDualState.secondHand.handPosition.x = secondHand.pos.x;
+                gDualState.secondHand.handPosition.y = secondHand.pos.y;
+                gDualState.secondHand.handPosition.z = secondHand.pos.z;
+                gDualState.secondHand.handValid = IsFiniteVector(gDualState.secondHand.handPosition);
+            }
+        }
+        return gDualState.secondHand.weaponValid || gDualState.secondHand.handValid || gDualState.nativeHand.handValid;
+    }
+
+    static void MaybeLogHandState() {
+        if (!gConfig.logHandState || !gDualState.active)
+            return;
+        const unsigned int frame = CTimer::m_FrameCounter;
+        if (frame - gLastHandStateLogFrame < static_cast<unsigned int>(gConfig.handStateLogInterval))
+            return;
+        gLastHandStateLogFrame = frame;
+
+        char line[512];
+        std::snprintf(line, sizeof(line),
+            "DualWieldIII hand state: pose=%d blend=%.2f nativeHand=(%.3f %.3f %.3f) nativeMuzzle=(%.3f %.3f %.3f valid=%d) secondHand=(%.3f %.3f %.3f) secondMuzzle=(%.3f %.3f %.3f valid=%d).",
+            static_cast<int>(gDualState.pose), gDualState.aimBlend,
+            gDualState.nativeHand.handPosition.x, gDualState.nativeHand.handPosition.y, gDualState.nativeHand.handPosition.z,
+            gDualState.nativeHand.muzzle.x, gDualState.nativeHand.muzzle.y, gDualState.nativeHand.muzzle.z,
+            gDualState.nativeHand.muzzleValid ? 1 : 0,
+            gDualState.secondHand.handPosition.x, gDualState.secondHand.handPosition.y, gDualState.secondHand.handPosition.z,
+            gDualState.secondHand.muzzle.x, gDualState.secondHand.muzzle.y, gDualState.secondHand.muzzle.z,
+            gDualState.secondHand.muzzleValid ? 1 : 0);
+        Log(line);
     }
 
     static RwObject* CreateModelInstance(CBaseModelInfo* modelInfo) {
@@ -556,7 +1031,7 @@ namespace DualWieldIII {
 
         // CPed::AddWeaponModel(0x4CF8F0) calls [modelInfo->vtable + 0x0C].
         // Use that exact virtual slot instead of depending on a Plugin-SDK wrapper.
-        typedef RwObject* (__thiscall *CreateInstanceFn)(CBaseModelInfo*);
+        typedef RwObject* (__thiscall* CreateInstanceFn)(CBaseModelInfo*);
         void** vtable = *reinterpret_cast<void***>(modelInfo);
         if (!vtable || !vtable[3])
             return 0;
@@ -582,7 +1057,7 @@ namespace DualWieldIII {
 
         RwFrame* sourceHand = 0;
         if (!skinned) {
-            sourceHand = GetPedFrameSafe(ped, 5);
+            sourceHand = GetPedFrameSafe(ped, PED_FRAME_SECOND_HAND);
             if (!sourceHand)
                 return false;
         }
@@ -611,8 +1086,12 @@ namespace DualWieldIII {
 
         bool posed = false;
         if (skinned) {
+            RwMatrix* nativeHand = GetSkinBoneMatrix(skinHierarchy, BONE_SRHAND);
             RwMatrix* leftHand = GetSkinBoneMatrix(skinHierarchy, BONE_SLHAND);
-            posed = leftHand && PutWeaponFrameOnWorldMatrix(helper, *leftHand);
+            RwMatrix socketWorld;
+            posed = nativeHand && leftHand &&
+                BuildOppositeGripWorld(ped, skinHierarchy, *nativeHand, *leftHand, socketWorld) &&
+                PutWeaponFrameOnWorldMatrix(helper, socketWorld);
         }
         else {
             posed = PutWeaponFrameOnHand(helper, sourceHand);
@@ -634,7 +1113,40 @@ namespace DualWieldIII {
         gLeft.skinnedSource = skinned;
         gLeft.modelId = info->m_nModelId;
         gLeft.weaponType = weapon->m_eWeaponType;
+
+        if (skinned && !gLoggedSkinnedPedMode) {
+            char line[320];
+            std::snprintf(line, sizeof(line),
+                "DualWieldIII: skinned ped path active; HAnim=%p nodes=%d leftHand=%p. m_apFrames[*].m_pFrame is NOT treated as RwFrame.",
+                skinHierarchy, skinHierarchy ? skinHierarchy->numNodes : 0,
+                skinHierarchy ? GetSkinBoneMatrix(skinHierarchy, BONE_SLHAND) : 0);
+            Log(line);
+            gLoggedSkinnedPedMode = true;
+        }
         return true;
+    }
+
+    static void LogCreateFailureOccasionally(CPed* ped, CWeapon* weapon, CWeaponInfo* info, bool skinned) {
+        const unsigned int frame = CTimer::m_FrameCounter;
+        if (gLoggedCreateFailure && frame - gCreateFailureFrame < 300)
+            return;
+        gLoggedCreateFailure = true;
+        gCreateFailureFrame = frame;
+
+        char line[512];
+        RpHAnimHierarchy* hierarchy = 0;
+        const bool hasHierarchy = GetSkinnedPedHierarchy(ped, hierarchy);
+        const void* nativeWeapon = (gSkinBonesGetPedWeaponAtomic && ped)
+            ? reinterpret_cast<void*>(gSkinBonesGetPedWeaponAtomic(ped)) : 0;
+        std::snprintf(line, sizeof(line),
+            "DualWieldIII: create deferred. ped=%p state=%d inVeh=%d weapon=%d modelField=%d infoModel=%d skinned=%d hierarchy=%p S&Bweapon=%p.",
+            ped, ped ? static_cast<int>(ped->m_ePedState) : -1,
+            ped ? static_cast<int>(ped->m_bInVehicle) : -1,
+            weapon ? static_cast<int>(weapon->m_eWeaponType) : -1,
+            ped ? ped->m_nWepModelID : -999,
+            info ? info->m_nModelId : -999,
+            skinned ? 1 : 0, hasHierarchy ? hierarchy : 0, nativeWeapon);
+        Log(line);
     }
 
     static void UpdateLeftWeapon() {
@@ -646,8 +1158,21 @@ namespace DualWieldIII {
 
         ResolveSkinBonesApi();
 
-        if (gLeft.owner == ped && gLeft.ownerClump && gLeft.ownerClump != ped->m_pRwClump)
+        const bool activeAimNow = ped->bIsAimingGun || ped->bIsPointingGunAt ||
+            ped->bIsShooting || ped->m_ePedState == PEDSTATE_AIMGUN ||
+            ped->m_ePedState == PEDSTATE_ATTACK;
+        if (!activeAimNow) {
+            gAimBlend = 0.0f;
+            gAimBlendFrame = 0xFFFFFFFFu;
+        }
+
+        if (gLeft.owner == ped && gLeft.ownerClump && gLeft.ownerClump != ped->m_pRwClump) {
+            if (!gLoggedClumpReplacement) {
+                Log("DualWieldIII: player clump replaced; destroying standalone second weapon and rebinding cleanly.");
+                gLoggedClumpReplacement = true;
+            }
             DestroyLeftWeapon();
+        }
 
         CWeapon* weapon = ped->GetWeapon();
         CWeaponInfo* info = weapon ? CWeaponInfo::GetWeaponInfo(weapon->m_eWeaponType) : 0;
@@ -657,6 +1182,7 @@ namespace DualWieldIII {
 
         if (!weapon || !info || modelId < 0 || !NativeWeaponModelReady(ped, info, skinned)) {
             DestroyLeftWeapon();
+            LogCreateFailureOccasionally(ped, weapon, info, skinned);
             return;
         }
 
@@ -666,7 +1192,7 @@ namespace DualWieldIII {
                 DestroyLeftWeapon();
             }
             else if (!skinned) {
-                RwFrame* currentSourceHand = GetPedFrameSafe(ped, 5);
+                RwFrame* currentSourceHand = GetPedFrameSafe(ped, PED_FRAME_SECOND_HAND);
                 if (!currentSourceHand || gLeft.sourceHandFrame != currentSourceHand)
                     DestroyLeftWeapon();
                 else {
@@ -689,7 +1215,8 @@ namespace DualWieldIII {
             DestroyLeftWeapon();
         }
 
-        CreateLeftWeapon(ped);
+        if (!CreateLeftWeapon(ped))
+            LogCreateFailureOccasionally(ped, weapon, info, skinned);
     }
 
     struct Basis3 {
@@ -709,7 +1236,8 @@ namespace DualWieldIII {
 
         MirroredArmChain()
             : valid(false), nativeUpper(0), nativeLower(0), nativeHand(0),
-              mirrorUpper(0), mirrorLower(0), mirrorHand(0) {}
+            mirrorUpper(0), mirrorLower(0), mirrorHand(0) {
+        }
     };
 
     static CVector Vec3(float x, float y, float z) {
@@ -809,6 +1337,89 @@ namespace DualWieldIII {
         out.up = BasisTransformDirection(parent, child.up);
         out.at = BasisTransformDirection(parent, child.at);
         return OrthonormalizeBasis(out);
+    }
+
+    static Basis3 InverseOrthonormalBasis(const Basis3& basis) {
+        // Basis vectors are matrix columns. For an orthonormal rotation the inverse is
+        // the transpose, so the inverse columns are the original rows.
+        Basis3 out;
+        out.right = Vec3(basis.right.x, basis.up.x, basis.at.x);
+        out.up = Vec3(basis.right.y, basis.up.y, basis.at.y);
+        out.at = Vec3(basis.right.z, basis.up.z, basis.at.z);
+        return OrthonormalizeBasis(out);
+    }
+
+    static bool BuildOppositeGripWorld(
+        CPed* ped,
+        RpHAnimHierarchy* hierarchy,
+        const RwMatrix& nativeHand,
+        const RwMatrix& secondHand,
+        RwMatrix& out
+    ) {
+        if (!IsFiniteRwMatrix(nativeHand) || !IsFiniteRwMatrix(secondHand))
+            return false;
+
+        // Skin & Bones places the stock gun directly on SRhand. The same unmirrored
+        // weapon model cannot simply inherit SLhand's mirrored bind orientation though.
+        // Derive the ONE constant left-hand -> native-hand rotation from the skin's own
+        // inverse bind matrices:
+        //
+        //      C = inverse(BindSecond) * BindNative
+        //      weaponWorld = SecondHandWorld * C
+        //
+        // RpSkinGetSkinToBoneMatrices returns inverse bind matrices, so
+        // inverse(BindSecond) is available directly and BindNative is the transpose of
+        // the native inverse-bind rotation. This correction is skeleton data, not an
+        // animation-dependent best-fit choice; recoil/walking can never make it flip.
+        RpSkin* skin = 0;
+        RpHAnimHierarchy* skinHierarchy = 0;
+        if (ped && GetSkinnedPedSkinHierarchy(ped, skin, skinHierarchy) &&
+            skin && skinHierarchy && (!hierarchy || hierarchy == skinHierarchy)) {
+            const int nativeHAnimIndex = RpHAnimIDGetIndex(skinHierarchy, BONE_SRHAND);
+            const int secondHAnimIndex = RpHAnimIDGetIndex(skinHierarchy, BONE_SLHAND);
+            int nativeIndex = nativeHAnimIndex;
+            int secondIndex = secondHAnimIndex;
+            if (nativeHAnimIndex >= 0 && nativeHAnimIndex < skinHierarchy->numNodes &&
+                secondHAnimIndex >= 0 && secondHAnimIndex < skinHierarchy->numNodes &&
+                skinHierarchy->pNodeInfo) {
+                const int n = skinHierarchy->pNodeInfo[nativeHAnimIndex].nodeIndex;
+                const int s = skinHierarchy->pNodeInfo[secondHAnimIndex].nodeIndex;
+                if (n >= 0 && n < skinHierarchy->numNodes) nativeIndex = n;
+                if (s >= 0 && s < skinHierarchy->numNodes) secondIndex = s;
+            }
+            const int maxIndex = nativeIndex > secondIndex ? nativeIndex : secondIndex;
+            SkinGetSkinToBoneMatricesFn getSkinToBone =
+                reinterpret_cast<SkinGetSkinToBoneMatricesFn>(ADDR_SKIN_GET_SKIN_TO_BONE_MATRICES);
+            RwMatrix* inverseBind = getSkinToBone ? getSkinToBone(skin) : 0;
+
+            if (nativeIndex >= 0 && secondIndex >= 0 && maxIndex < skinHierarchy->numNodes &&
+                inverseBind && IsReadableAddress(inverseBind,
+                    sizeof(RwMatrix) * static_cast<size_t>(maxIndex + 1)) &&
+                IsFiniteRwMatrix(inverseBind[nativeIndex]) &&
+                IsFiniteRwMatrix(inverseBind[secondIndex])) {
+                const Basis3 nativeInvBind = BasisFromRwMatrix(&inverseBind[nativeIndex]);
+                const Basis3 secondInvBind = BasisFromRwMatrix(&inverseBind[secondIndex]);
+                const Basis3 nativeBind = InverseOrthonormalBasis(nativeInvBind);
+                const Basis3 correction = ComposeBasis(secondInvBind, nativeBind);
+                const Basis3 secondWorld = BasisFromRwMatrix(&secondHand);
+                const Basis3 weaponWorld = ComposeBasis(secondWorld, correction);
+
+                out = secondHand;
+                out.right.x = weaponWorld.right.x; out.right.y = weaponWorld.right.y; out.right.z = weaponWorld.right.z;
+                out.up.x = weaponWorld.up.x;    out.up.y = weaponWorld.up.y;    out.up.z = weaponWorld.up.z;
+                out.at.x = weaponWorld.at.x;    out.at.y = weaponWorld.at.y;    out.at.z = weaponWorld.at.z;
+                // The weapon origin remains the actual SLhand bone origin. Optional
+                // Offset*/Rotation* INI trim is applied afterwards in weapon-local space.
+                return IsFiniteRwMatrix(out);
+            }
+        }
+
+        // Stock/non-skinned fallback: GTA's native weapon basis is already known-good.
+        // Borrow only that orientation while anchoring translation to the real opposite
+        // hand. This is stable and avoids the v18 identity/180X/180Y/180Z chooser.
+        out = nativeHand;
+        out.pos = secondHand.pos;
+        return IsFiniteRwMatrix(out);
     }
 
     static Basis3 GetFrameWorldBasis(RwFrame* frame) {
@@ -915,7 +1526,7 @@ namespace DualWieldIII {
             return;
 
         // IMPORTANT: do not merely write RwFrame::modelling and later dirty only the
-        // upper arm. RenderWare tracks dirty state per frame. Direct matrix writes could leave
+        // upper arm. RenderWare tracks dirty state per frame. The v2 code could leave
         // the lower arm/hand using cached LTMs, which makes the visual result look like
         // the untouched fight/locomotion pose. RwFrameTransform marks THIS frame and
         // the hierarchy root dirty exactly like RenderWare's own frame mutators.
@@ -942,10 +1553,10 @@ namespace DualWieldIII {
         //   m_apFrames[6] = SRhand       (native weapon hand)
         //   m_apFrames[3] = Supperarml   (opposite upper arm)
         //   m_apFrames[5] = SLhand       (opposite hand)
-        chain.nativeUpper = GetPedFrameSafe(ped, 4);
-        chain.nativeHand = GetPedFrameSafe(ped, 6);
-        chain.mirrorUpper = GetPedFrameSafe(ped, 3);
-        chain.mirrorHand = GetPedFrameSafe(ped, 5);
+        chain.nativeUpper = GetPedFrameSafe(ped, PED_FRAME_NATIVE_UPPER);
+        chain.nativeHand = GetPedFrameSafe(ped, PED_FRAME_NATIVE_HAND);
+        chain.mirrorUpper = GetPedFrameSafe(ped, PED_FRAME_SECOND_UPPER);
+        chain.mirrorHand = GetPedFrameSafe(ped, PED_FRAME_SECOND_HAND);
         if (!chain.nativeUpper || !chain.nativeHand || !chain.mirrorUpper || !chain.mirrorHand)
             return false;
 
@@ -970,11 +1581,10 @@ namespace DualWieldIII {
         return true;
     }
 
-    // GTA III's hgun animation is partial: it supplies the large weapon-arm pose only
-    // on the stock arm, then its gun IK adds the final correction. The working approach
-    // mirrors the final shoulder->elbow and elbow->hand geometry. Skin & Bones uses the
-    // same operation on the final HAnim matrix array instead of treating its animation
-    // data as stock RwFrame pointers.
+    // GTA III's hgun animation supplies the native weapon-arm base pose, then AimGun
+    // applies the final gun-IK correction. We sample that finished intent at the AimGun
+    // stage and rotate the opposite arm locally. Skin & Bones uses HAnim interpolation
+    // quaternions; final matrix-array entries are treated strictly as solver output.
 
     static CVector BlendDirection(const CVector& from, const CVector& to, float t) {
         const CVector a = Normalize3(from, Vec3(0.0f, 1.0f, 0.0f));
@@ -983,50 +1593,203 @@ namespace DualWieldIII {
         return Normalize3(Add3(Scale3(a, 1.0f - clamped), Scale3(b, clamped)), b);
     }
 
-    static float UpdateAimBlendOncePerFrame(bool active) {
-        if (!active) {
-            gAimBlend = 0.0f;
-            gAimBlendFrame = CTimer::m_FrameCounter;
-            return 0.0f;
-        }
-
+    static float UpdateAimBlendOncePerFrame(float targetBlend) {
+        targetBlend = ClampFloat(targetBlend, 0.0f, 1.0f);
         const unsigned int frame = CTimer::m_FrameCounter;
         if (frame != gAimBlendFrame) {
             gAimBlendFrame = frame;
             if (gConfig.aimBlendFrames <= 1)
-                gAimBlend = 1.0f;
+                gAimBlend = targetBlend;
+            else if (targetBlend > gAimBlend)
+                gAimBlend = ClampFloat(gAimBlend + 1.0f / static_cast<float>(gConfig.aimBlendFrames), 0.0f, targetBlend);
             else
-                gAimBlend = ClampFloat(gAimBlend + 1.0f / static_cast<float>(gConfig.aimBlendFrames), 0.0f, 1.0f);
+                gAimBlend = targetBlend;
         }
         return gAimBlend;
     }
 
-    static bool ShouldMirrorAimPose(CPed* ped, bool nativeArmRaised, float& blend) {
+    static bool ShouldMirrorAimPose(CPed* ped, float& blend) {
         blend = 0.0f;
-        if (!ped || !nativeArmRaised) {
-            gAimGraceFramesRemaining = 0;
-            UpdateAimBlendOncePerFrame(false);
+        if (!ped || !ContinuousAimIntent(ped))
             return false;
-        }
 
-        bool active = ped->bIsAimingGun || ped->bIsPointingGunAt ||
-            ped->bIsShooting || ped->m_ePedState == PEDSTATE_AIMGUN ||
+        CWeapon* weapon = ped->GetWeapon();
+        if (!weapon)
+            return false;
+
+        const bool firing = ped->bIsShooting || weapon->m_eWeaponState == WEAPONSTATE_FIRING ||
             ped->m_ePedState == PEDSTATE_ATTACK;
-        if (active) {
-            gAimGraceFramesRemaining = gConfig.aimGraceFrames;
+        const float targetBlend = firing ? gConfig.firePoseBlend : gConfig.aimPoseBlend;
+        if (firing) {
+            gAimBlend = ClampFloat(targetBlend, 0.0f, 1.0f);
+            gAimBlendFrame = CTimer::m_FrameCounter;
+            blend = gAimBlend;
         }
-        else if (gAimGraceFramesRemaining > 0) {
-            --gAimGraceFramesRemaining;
-            active = true;
+        else {
+            blend = UpdateAimBlendOncePerFrame(targetBlend);
         }
+        return blend > 0.001f;
+    }
 
-        if (!active) {
-            UpdateAimBlendOncePerFrame(false);
+
+    static bool GetActiveWeaponLocalFireDirection(CPed* ped, CVector& localDir) {
+        if (!ped)
             return false;
+        CWeapon* weapon = ped->GetWeapon();
+        if (!weapon)
+            return false;
+        CWeaponInfo* info = CWeaponInfo::GetWeaponInfo(weapon->m_eWeaponType);
+        if (!info)
+            return false;
+        localDir = Normalize3(
+            Vec3(info->m_vecFireOffset.x, info->m_vecFireOffset.y, info->m_vecFireOffset.z),
+            Vec3(0.0f, 1.0f, 0.0f));
+        return IsFiniteVector(localDir);
+    }
+
+    static bool ComputeNativeAndSecondWeaponDirections(
+        CPed* ped,
+        const RwMatrix& nativeHandWorld,
+        const RwMatrix& secondHandWorld,
+        CVector& nativeWeaponDir,
+        CVector& secondWeaponDir
+    ) {
+        CVector localFireDir;
+        if (!GetActiveWeaponLocalFireDirection(ped, localFireDir))
+            return false;
+
+        // GTA III's native weapon is attached directly to SRhand. The duplicate uses
+        // our grip correction before SLhand, so measure the duplicate through the same
+        // corrected weapon matrix that is actually rendered/fired.
+        nativeWeaponDir = Normalize3(
+            BasisTransformDirection(BasisFromRwMatrix(&nativeHandWorld), localFireDir),
+            Vec3(0.0f, 1.0f, 0.0f));
+
+        RwMatrix secondWeaponWorld;
+        if (!ComputeWeaponWorldFromHand(secondHandWorld, secondWeaponWorld))
+            return false;
+        secondWeaponDir = Normalize3(
+            BasisTransformDirection(BasisFromRwMatrix(&secondWeaponWorld), localFireDir),
+            nativeWeaponDir);
+
+        return IsFiniteVector(nativeWeaponDir) && IsFiniteVector(secondWeaponDir);
+    }
+
+    static CVector ProjectDirectionOntoPlane(const CVector& v, const CVector& normal, const CVector& fallback) {
+        const CVector n = Normalize3(normal, Vec3(0.0f, 1.0f, 0.0f));
+        return Normalize3(Sub3(v, Scale3(n, Dot3(v, n))), fallback);
+    }
+
+    static bool ComputeWeaponRollCorrection(
+        CPed* ped,
+        const RwMatrix& nativeHandWorld,
+        const RwMatrix& secondHandWorld,
+        float blend,
+        CVector& worldAxis,
+        float& radians
+    ) {
+        radians = 0.0f;
+        if (!gConfig.stabilizeSecondHandRoll || !ped || blend <= 0.001f)
+            return true;
+
+        CVector nativeWeaponDir, secondWeaponDir;
+        if (!ComputeNativeAndSecondWeaponDirections(
+            ped, nativeHandWorld, secondHandWorld, nativeWeaponDir, secondWeaponDir))
+            return false;
+
+        RwMatrix secondWeaponWorld;
+        if (!ComputeWeaponWorldFromHand(secondHandWorld, secondWeaponWorld))
+            return false;
+
+        // Native GTA III attaches the weapon atomic directly to SRhand, so the native
+        // hand basis is the native weapon basis. After our 180-degree grip correction,
+        // the duplicate weapon should carry the same roll around the shared fire axis.
+        const Basis3 nativeWeaponBasis = BasisFromRwMatrix(&nativeHandWorld);
+        const Basis3 secondWeaponBasis = BasisFromRwMatrix(&secondWeaponWorld);
+        const CVector axis = Normalize3(nativeWeaponDir, Vec3(0.0f, 1.0f, 0.0f));
+
+        CVector nativeReference = ProjectDirectionOntoPlane(nativeWeaponBasis.up, axis,
+            ProjectDirectionOntoPlane(nativeWeaponBasis.right, axis, Vec3(1.0f, 0.0f, 0.0f)));
+        CVector secondReference = ProjectDirectionOntoPlane(secondWeaponBasis.up, axis,
+            ProjectDirectionOntoPlane(secondWeaponBasis.right, axis, nativeReference));
+
+        const float c = ClampFloat(Dot3(secondReference, nativeReference), -1.0f, 1.0f);
+        const float sgn = Dot3(Cross3(secondReference, nativeReference), axis);
+        float angle = std::atan2(sgn, c) * ClampFloat(blend * gConfig.handRollBlend, 0.0f, 1.0f);
+        const float limit = gConfig.handRollLimitDeg * 0.01745329251994329577f;
+        if (limit > 0.0f) {
+            if (angle > limit) angle = limit;
+            if (angle < -limit) angle = -limit;
         }
 
-        blend = UpdateAimBlendOncePerFrame(true);
-        return blend > 0.0f;
+        worldAxis = axis;
+        radians = angle;
+        return IsFiniteFloat(radians) && IsFiniteVector(worldAxis);
+    }
+
+    static bool StabilizeStockSecondHandWeaponRoll(CPed* ped, const MirroredArmChain& chain, float blend) {
+        if (!gConfig.stabilizeSecondHandRoll || !ped || !chain.valid || blend <= 0.001f)
+            return true;
+
+        RwMatrix nativeHandWorld;
+        RwMatrix secondHandWorld;
+        if (!GetFrameWorldMatrixManual(chain.nativeHand, nativeHandWorld) ||
+            !GetFrameWorldMatrixManual(chain.mirrorHand, secondHandWorld))
+            return false;
+
+        CVector axisWorld;
+        float radians = 0.0f;
+        if (!ComputeWeaponRollCorrection(ped, nativeHandWorld, secondHandWorld, blend, axisWorld, radians))
+            return false;
+        if (std::fabs(radians) < 1.0e-5f)
+            return true;
+
+        Basis3 handWorld = GetFrameWorldBasis(chain.mirrorHand);
+        const float c = std::cos(radians);
+        const float sn = std::sin(radians);
+        handWorld.right = RotateAroundAxis(handWorld.right, axisWorld, c, sn);
+        handWorld.up = RotateAroundAxis(handWorld.up, axisWorld, c, sn);
+        handWorld.at = RotateAroundAxis(handWorld.at, axisWorld, c, sn);
+        SetFrameWorldBasis(chain.mirrorHand, handWorld);
+        RwFrameGetLTM(chain.mirrorHand);
+        return true;
+    }
+
+    static bool StabilizeStockSecondHandWeaponForward(
+        CPed* ped,
+        const MirroredArmChain& chain,
+        float blend
+    ) {
+        if (!gConfig.stabilizeSecondHand || !ped || !chain.valid || blend <= 0.001f)
+            return true;
+
+        RwMatrix nativeHandWorld;
+        RwMatrix secondHandWorld;
+        if (!GetFrameWorldMatrixManual(chain.nativeHand, nativeHandWorld) ||
+            !GetFrameWorldMatrixManual(chain.mirrorHand, secondHandWorld))
+            return false;
+
+        CVector nativeWeaponDir, secondWeaponDir;
+        if (!ComputeNativeAndSecondWeaponDirections(
+            ped, nativeHandWorld, secondHandWorld, nativeWeaponDir, secondWeaponDir))
+            return false;
+
+        const float dot = ClampFloat(Dot3(secondWeaponDir, nativeWeaponDir), -1.0f, 1.0f);
+        const float fullRadians = std::acos(dot);
+        float targetRadians = fullRadians * ClampFloat(blend * gConfig.handAimBlend, 0.0f, 1.0f);
+        const float limitRadians = gConfig.handAimLimitDeg * 0.01745329251994329577f;
+        if (limitRadians > 0.0f && targetRadians > limitRadians)
+            targetRadians = limitRadians;
+        const float directionBlend = fullRadians > 1.0e-5f
+            ? ClampFloat(targetRadians / fullRadians, 0.0f, 1.0f)
+            : 0.0f;
+        const CVector desiredDir = BlendDirection(secondWeaponDir, nativeWeaponDir, directionBlend);
+
+        Basis3 handWorld = GetFrameWorldBasis(chain.mirrorHand);
+        handWorld = RotateBasisFromTo(handWorld, secondWeaponDir, desiredDir);
+        SetFrameWorldBasis(chain.mirrorHand, handWorld);
+        RwFrameGetLTM(chain.mirrorHand);
+        return true;
     }
 
     static void MirrorNativeGunArmPose(CPed* ped, const MirroredArmChain& chain, float blend) {
@@ -1043,7 +1806,12 @@ namespace DualWieldIII {
             !GetFrameWorldPosition(chain.mirrorHand, mirrorHand))
             return;
 
-        const CVector mirrorNormal = Normalize3(ped->GetRight(), Vec3(1.0f, 0.0f, 0.0f));
+        // Use the actual shoulder-to-shoulder axis as the sagittal-plane normal.
+        // Unlike ped->GetRight(), this follows torso twist already contributed by the
+        // current locomotion/weapon animation.
+        const CVector mirrorNormal = Normalize3(
+            Sub3(nativeShoulder, mirrorShoulder),
+            Normalize3(ped->GetRight(), Vec3(1.0f, 0.0f, 0.0f)));
 
         const CVector currentUpperDir = Sub3(mirrorElbow, mirrorShoulder);
         const CVector mirroredUpperDir = ReflectDirection(Sub3(nativeElbow, nativeShoulder), mirrorNormal);
@@ -1065,28 +1833,302 @@ namespace DualWieldIII {
         lowerWorld = RotateBasisFromTo(lowerWorld, currentLowerDir, desiredLowerDir);
         SetFrameWorldBasis(chain.mirrorLower, lowerWorld);
         RwFrameGetLTM(chain.mirrorHand);
+
+        // Forward locomotion contributes a strong wrist/hand swing to the opposite arm.
+        // Segment-direction correction alone leaves that twist intact, so the clone can
+        // visibly wag even though shoulder/elbow/hand positions are correct. Stabilize
+        // the actual corrected weapon-forward cue at the HAND, not a guessed world matrix.
+        StabilizeStockSecondHandWeaponForward(ped, chain, blend);
+        StabilizeStockSecondHandWeaponRoll(ped, chain, blend);
     }
 
-    static bool NativeGunArmIsRaised(const MirroredArmChain& chain) {
-        if (!chain.valid)
-            return false;
-        CVector shoulder, hand;
-        if (!GetFrameWorldPosition(chain.nativeUpper, shoulder) ||
-            !GetFrameWorldPosition(chain.nativeHand, hand))
-            return false;
-        return hand.z > shoulder.z - 0.25f;
+    struct RawHAnimInterpFrame {
+        uint32_t keyFrame1;
+        uint32_t keyFrame2;
+        RtQuat q;
+        RwV3d t;
+    };
+    static_assert(sizeof(RawHAnimInterpFrame) == 0x24, "Unexpected standard HAnim interpolation-frame size");
+
+    static RawHAnimInterpFrame* GetHAnimInterpFrame(RpHAnimHierarchy* hierarchy, int boneId) {
+        if (!hierarchy || hierarchy->numNodes <= 0 || hierarchy->numNodes > 128)
+            return 0;
+
+        const int index = RpHAnimIDGetIndex(hierarchy, boneId);
+        if (index < 0 || index >= hierarchy->numNodes)
+            return 0;
+
+        // RenderWare 3.4/3.5 HAnim stores the current interpolated keyframes directly
+        // after RpHAnimHierarchy. The SDK's rpHANIMHIERARCHYGETINTERPFRAME macro is
+        // exactly this calculation. Standard frames are 0x24 bytes; reject anything
+        // smaller or absurd rather than guessing into another interpolation scheme.
+        const int keyFrameSize = hierarchy->currentKeyFrameSize;
+        if (keyFrameSize != static_cast<int>(sizeof(RawHAnimInterpFrame)))
+            return 0;
+
+        unsigned char* base = reinterpret_cast<unsigned char*>(hierarchy + 1);
+        const size_t totalBytes = static_cast<size_t>(hierarchy->numNodes) * static_cast<size_t>(keyFrameSize);
+        if (totalBytes / static_cast<size_t>(keyFrameSize) != static_cast<size_t>(hierarchy->numNodes) ||
+            !IsReadableAddress(base, totalBytes))
+            return 0;
+
+        RawHAnimInterpFrame* frame = reinterpret_cast<RawHAnimInterpFrame*>(
+            base + static_cast<size_t>(index) * static_cast<size_t>(keyFrameSize));
+        return IsReadableAddress(frame, sizeof(RawHAnimInterpFrame)) ? frame : 0;
     }
 
-    struct AxisRotation {
+    static CVector WorldAxisToParentLocal(const CVector& axisWorld, const RwMatrix& parentWorld) {
+        return Normalize3(Vec3(
+            Dot3(axisWorld, Vec3(parentWorld.right.x, parentWorld.right.y, parentWorld.right.z)),
+            Dot3(axisWorld, Vec3(parentWorld.up.x, parentWorld.up.y, parentWorld.up.z)),
+            Dot3(axisWorld, Vec3(parentWorld.at.x, parentWorld.at.y, parentWorld.at.z))),
+            Vec3(0.0f, 0.0f, 1.0f));
+    }
+
+    static bool RotateSkinnedBoneTowardDirection(
+        RpHAnimHierarchy* hierarchy,
+        int boneId,
+        int parentBoneId,
+        int childBoneId,
+        const CVector& desiredWorldDirection,
+        float blend,
+        float maxRadians
+    ) {
+        if (!hierarchy || blend <= 0.001f)
+            return false;
+
+        RawHAnimInterpFrame* interp = GetHAnimInterpFrame(hierarchy, boneId);
+        RwMatrix* bone = GetSkinBoneMatrix(hierarchy, boneId);
+        RwMatrix* parent = GetSkinBoneMatrix(hierarchy, parentBoneId);
+        RwMatrix* child = GetSkinBoneMatrix(hierarchy, childBoneId);
+        if (!interp || !bone || !parent || !child)
+            return false;
+
+        const CVector bonePos = Vec3(bone->pos.x, bone->pos.y, bone->pos.z);
+        const CVector childPos = Vec3(child->pos.x, child->pos.y, child->pos.z);
+        const CVector currentDirection = Normalize3(Sub3(childPos, bonePos), desiredWorldDirection);
+        const CVector desiredDirection = Normalize3(desiredWorldDirection, currentDirection);
+        const float dot = ClampFloat(Dot3(currentDirection, desiredDirection), -1.0f, 1.0f);
+        if (dot > 0.99995f)
+            return true;
+
+        CVector axisWorld = Cross3(currentDirection, desiredDirection);
+        float axisLenSq = Dot3(axisWorld, axisWorld);
+        if (!IsFiniteFloat(axisLenSq) || axisLenSq < 1.0e-8f) {
+            // Nearly 180 degrees: use a stable axis from the parent's current basis.
+            axisWorld = Cross3(currentDirection,
+                Vec3(parent->up.x, parent->up.y, parent->up.z));
+            axisLenSq = Dot3(axisWorld, axisWorld);
+            if (axisLenSq < 1.0e-8f)
+                axisWorld = Cross3(currentDirection,
+                    Vec3(parent->right.x, parent->right.y, parent->right.z));
+            axisLenSq = Dot3(axisWorld, axisWorld);
+            if (axisLenSq < 1.0e-8f)
+                return false;
+        }
+        axisWorld = Scale3(axisWorld, 1.0f / std::sqrt(axisLenSq));
+        const CVector axisLocal = WorldAxisToParentLocal(axisWorld, *parent);
+
+        float radians = std::acos(dot) * ClampFloat(blend, 0.0f, 1.0f);
+        if (maxRadians > 0.0f && radians > maxRadians)
+            radians = maxRadians;
+        if (radians < 1.0e-5f)
+            return true;
+
+        RwV3d rwAxis = { axisLocal.x, axisLocal.y, axisLocal.z };
+        RtQuatRotate(&interp->q, &rwAxis, radians * 57.29577951308232f, rwCOMBINEPRECONCAT);
+
+        // axisLocal is expressed in the PARENT bone's coordinate system. For a child
+        // local quaternion that correction must be PRE-concatenated (R * q), not
+        // POST-concatenated (q * R). The latter interprets the same axis as child-local
+        // and is exactly what made the correction wander as the walking parent rotated.
+        // Rebuild the hierarchy from the corrected local quaternion.
+        return RpHAnimHierarchyUpdateMatrices(hierarchy) != 0;
+    }
+
+
+    static bool StabilizeSkinnedSecondHandWeaponForward(
+        CPed* ped,
+        RpHAnimHierarchy* hierarchy,
+        float blend
+    ) {
+        if (!gConfig.stabilizeSecondHand || !ped || !hierarchy || blend <= 0.001f)
+            return true;
+
+        RawHAnimInterpFrame* handInterp = GetHAnimInterpFrame(hierarchy, BONE_SLHAND);
+        RwMatrix* nativeHand = GetSkinBoneMatrix(hierarchy, BONE_SRHAND);
+        RwMatrix* secondLower = GetSkinBoneMatrix(hierarchy, BONE_SLOWERARML);
+        RwMatrix* secondHand = GetSkinBoneMatrix(hierarchy, BONE_SLHAND);
+        if (!handInterp || !nativeHand || !secondLower || !secondHand)
+            return false;
+
+        CVector nativeWeaponDir, secondWeaponDir;
+        if (!ComputeNativeAndSecondWeaponDirections(
+            ped, *nativeHand, *secondHand, nativeWeaponDir, secondWeaponDir))
+            return false;
+
+        const float dot = ClampFloat(Dot3(secondWeaponDir, nativeWeaponDir), -1.0f, 1.0f);
+        if (dot > 0.99995f)
+            return true;
+
+        CVector axisWorld = Cross3(secondWeaponDir, nativeWeaponDir);
+        float axisLenSq = Dot3(axisWorld, axisWorld);
+        if (!IsFiniteFloat(axisLenSq) || axisLenSq < 1.0e-8f) {
+            // Stable 180-degree fallback from the forearm basis.
+            axisWorld = Cross3(secondWeaponDir,
+                Vec3(secondLower->up.x, secondLower->up.y, secondLower->up.z));
+            axisLenSq = Dot3(axisWorld, axisWorld);
+            if (axisLenSq < 1.0e-8f) {
+                axisWorld = Cross3(secondWeaponDir,
+                    Vec3(secondLower->right.x, secondLower->right.y, secondLower->right.z));
+                axisLenSq = Dot3(axisWorld, axisWorld);
+            }
+            if (axisLenSq < 1.0e-8f)
+                return false;
+        }
+        axisWorld = Scale3(axisWorld, 1.0f / std::sqrt(axisLenSq));
+
+        const CVector axisLocal = WorldAxisToParentLocal(axisWorld, *secondLower);
+        float radians = std::acos(dot) * ClampFloat(blend * gConfig.handAimBlend, 0.0f, 1.0f);
+        const float limitRadians = gConfig.handAimLimitDeg * 0.01745329251994329577f;
+        if (limitRadians > 0.0f && radians > limitRadians)
+            radians = limitRadians;
+        if (radians < 1.0e-5f)
+            return true;
+
+        RwV3d rwAxis = { axisLocal.x, axisLocal.y, axisLocal.z };
+        RtQuatRotate(&handInterp->q, &rwAxis,
+            radians * 57.29577951308232f, rwCOMBINEPRECONCAT);
+
+        // Local quaternion is the procedural input; matrix array is output. The
+        // animation system will refresh this local pose on the next animation update.
+        return RpHAnimHierarchyUpdateMatrices(hierarchy) != 0;
+    }
+
+
+    static bool StabilizeSkinnedSecondHandWeaponRoll(CPed* ped, RpHAnimHierarchy* hierarchy, float blend) {
+        if (!gConfig.stabilizeSecondHandRoll || !ped || !hierarchy || blend <= 0.001f)
+            return true;
+
+        RawHAnimInterpFrame* handInterp = GetHAnimInterpFrame(hierarchy, BONE_SLHAND);
+        RwMatrix* nativeHand = GetSkinBoneMatrix(hierarchy, BONE_SRHAND);
+        RwMatrix* secondLower = GetSkinBoneMatrix(hierarchy, BONE_SLOWERARML);
+        RwMatrix* secondHand = GetSkinBoneMatrix(hierarchy, BONE_SLHAND);
+        if (!handInterp || !nativeHand || !secondLower || !secondHand)
+            return false;
+
+        CVector axisWorld;
+        float radians = 0.0f;
+        if (!ComputeWeaponRollCorrection(ped, *nativeHand, *secondHand, blend, axisWorld, radians))
+            return false;
+        if (std::fabs(radians) < 1.0e-5f)
+            return true;
+
+        const CVector axisLocal = WorldAxisToParentLocal(axisWorld, *secondLower);
+        RwV3d rwAxis = { axisLocal.x, axisLocal.y, axisLocal.z };
+        RtQuatRotate(&handInterp->q, &rwAxis,
+            radians * 57.29577951308232f, rwCOMBINEPRECONCAT);
+        return RpHAnimHierarchyUpdateMatrices(hierarchy) != 0;
+    }
+
+    static bool MirrorSkinnedGunArmPose(CPed* ped, RpHAnimHierarchy* hierarchy, float blend) {
+        if (!ped || !hierarchy || blend <= 0.0f)
+            return false;
+
+        // CPed::AimGun has just changed the native arm's local HAnim quaternion.
+        // Materialize that finished native pose before measuring segment directions.
+        if (!RpHAnimHierarchyUpdateMatrices(hierarchy))
+            return false;
+
+        RwMatrix* nativeUpper = GetSkinBoneMatrix(hierarchy, BONE_SUPPERARMR);
+        RwMatrix* nativeLower = GetSkinBoneMatrix(hierarchy, BONE_SLOWERARMR);
+        RwMatrix* nativeHand = GetSkinBoneMatrix(hierarchy, BONE_SRHAND);
+        RwMatrix* mirrorUpper = GetSkinBoneMatrix(hierarchy, BONE_SUPPERARML);
+        RwMatrix* mirrorLower = GetSkinBoneMatrix(hierarchy, BONE_SLOWERARML);
+        RwMatrix* mirrorHand = GetSkinBoneMatrix(hierarchy, BONE_SLHAND);
+        if (!nativeUpper || !nativeLower || !nativeHand ||
+            !mirrorUpper || !mirrorLower || !mirrorHand)
+            return false;
+
+        const CVector nativeShoulder = Vec3(nativeUpper->pos.x, nativeUpper->pos.y, nativeUpper->pos.z);
+        const CVector nativeElbow = Vec3(nativeLower->pos.x, nativeLower->pos.y, nativeLower->pos.z);
+        const CVector nativeHandPos = Vec3(nativeHand->pos.x, nativeHand->pos.y, nativeHand->pos.z);
+        const CVector mirrorShoulder = Vec3(mirrorUpper->pos.x, mirrorUpper->pos.y, mirrorUpper->pos.z);
+
+        const CVector mirrorNormal = Normalize3(
+            Sub3(nativeShoulder, mirrorShoulder),
+            Normalize3(ped->GetRight(), Vec3(1.0f, 0.0f, 0.0f)));
+
+        // Xbox/Skin & Bones hierarchy IDs follow GTA III's 16-bone HAnim order:
+        // torso=8, native upper/lower/hand=10/11/12, opposite=13/14/15.
+        const CVector desiredUpperDir =
+            ReflectDirection(Sub3(nativeElbow, nativeShoulder), mirrorNormal);
+        if (!RotateSkinnedBoneTowardDirection(
+            hierarchy, BONE_SUPPERARML, 8, BONE_SLOWERARML,
+            desiredUpperDir, blend, 1.35f))
+            return false;
+
+        // Upper-arm correction has rebuilt the hierarchy, so measure the lower arm from
+        // its new current pose before applying the forearm correction.
+        mirrorLower = GetSkinBoneMatrix(hierarchy, BONE_SLOWERARML);
+        mirrorHand = GetSkinBoneMatrix(hierarchy, BONE_SLHAND);
+        if (!mirrorLower || !mirrorHand)
+            return false;
+
+        const CVector desiredLowerDir =
+            ReflectDirection(Sub3(nativeHandPos, nativeElbow), mirrorNormal);
+        if (!RotateSkinnedBoneTowardDirection(
+            hierarchy, BONE_SLOWERARML, BONE_SUPPERARML, BONE_SLHAND,
+            desiredLowerDir, blend, 1.55f))
+            return false;
+
+        // Correct the local hand quaternion enough to make the duplicate weapon's real
+        // fire-offset vector follow the native gun direction; do not write a final world matrix.
+        if (!StabilizeSkinnedSecondHandWeaponForward(ped, hierarchy, blend))
+            return false;
+        if (!StabilizeSkinnedSecondHandWeaponRoll(ped, hierarchy, blend))
+            return false;
+        return GetSkinBoneMatrix(hierarchy, BONE_SLHAND) != 0;
+    }
+
+
+    struct SkinnedSecondArmBackup {
+        bool valid;
+        RtQuat upperQ;
+        RtQuat lowerQ;
+        RtQuat handQ;
+        SkinnedSecondArmBackup() : valid(false) {
+            std::memset(&upperQ, 0, sizeof(upperQ));
+            std::memset(&lowerQ, 0, sizeof(lowerQ));
+            std::memset(&handQ, 0, sizeof(handQ));
+        }
+    };
+
+    struct MatrixAxisRotation {
         CVector axis;
         float c;
         float s;
         bool identity;
-        AxisRotation() : axis(Vec3(0.0f, 0.0f, 1.0f)), c(1.0f), s(0.0f), identity(true) {}
+        MatrixAxisRotation()
+            : axis(Vec3(0.0f, 0.0f, 1.0f)), c(1.0f), s(0.0f), identity(true) {
+        }
     };
 
-    static AxisRotation MakeAxisRotation(const CVector& fromVector, const CVector& toVector, const Basis3& hint) {
-        AxisRotation r;
+    static float Length3(const CVector& v) {
+        const float lenSq = Dot3(v, v);
+        return (!IsFiniteFloat(lenSq) || lenSq <= 0.0f) ? 0.0f : std::sqrt(lenSq);
+    }
+
+    static CVector ReflectPointAcrossPlane(const CVector& p, const CVector& planePoint, const CVector& unitNormal) {
+        return Sub3(p, Scale3(unitNormal, 2.0f * Dot3(Sub3(p, planePoint), unitNormal)));
+    }
+
+    static MatrixAxisRotation MakeMatrixAxisRotation(
+        const CVector& fromVector,
+        const CVector& toVector,
+        const Basis3& hint
+    ) {
+        MatrixAxisRotation r;
         const CVector from = Normalize3(fromVector, Vec3(0.0f, 1.0f, 0.0f));
         const CVector to = Normalize3(toVector, from);
         const float d = ClampFloat(Dot3(from, to), -1.0f, 1.0f);
@@ -1100,6 +2142,8 @@ namespace DualWieldIII {
             axisLenSq = Dot3(axis, axis);
             if (axisLenSq <= 0.000001f)
                 axis = Cross3(from, hint.right);
+            if (Dot3(axis, axis) <= 0.000001f)
+                return r;
             r.axis = Normalize3(axis, Vec3(0.0f, 0.0f, 1.0f));
             r.c = -1.0f;
             r.s = 0.0f;
@@ -1114,24 +2158,26 @@ namespace DualWieldIII {
         return r;
     }
 
-    static CVector ApplyAxisRotation(const CVector& v, const AxisRotation& r) {
-        if (r.identity)
-            return v;
-        return RotateAroundAxis(v, r.axis, r.c, r.s);
+    static CVector ApplyMatrixAxisRotation(const CVector& v, const MatrixAxisRotation& r) {
+        return r.identity ? v : RotateAroundAxis(v, r.axis, r.c, r.s);
     }
 
-    static void ApplyAxisRotationToMatrix(RwMatrix& matrix, const CVector& pivot, const AxisRotation& r) {
+    static void ApplyMatrixAxisRotationToWorldMatrix(
+        RwMatrix& matrix,
+        const CVector& pivot,
+        const MatrixAxisRotation& r
+    ) {
         if (r.identity)
             return;
 
         Basis3 basis = BasisFromRwMatrix(&matrix);
-        basis.right = ApplyAxisRotation(basis.right, r);
-        basis.up = ApplyAxisRotation(basis.up, r);
-        basis.at = ApplyAxisRotation(basis.at, r);
+        basis.right = ApplyMatrixAxisRotation(basis.right, r);
+        basis.up = ApplyMatrixAxisRotation(basis.up, r);
+        basis.at = ApplyMatrixAxisRotation(basis.at, r);
         basis = OrthonormalizeBasis(basis);
 
         const CVector oldPos = Vec3(matrix.pos.x, matrix.pos.y, matrix.pos.z);
-        const CVector newPos = Add3(pivot, ApplyAxisRotation(Sub3(oldPos, pivot), r));
+        const CVector newPos = Add3(pivot, ApplyMatrixAxisRotation(Sub3(oldPos, pivot), r));
 
         matrix.right.x = basis.right.x; matrix.right.y = basis.right.y; matrix.right.z = basis.right.z;
         matrix.up.x = basis.up.x; matrix.up.y = basis.up.y; matrix.up.z = basis.up.z;
@@ -1139,56 +2185,483 @@ namespace DualWieldIII {
         matrix.pos.x = newPos.x; matrix.pos.y = newPos.y; matrix.pos.z = newPos.z;
     }
 
-    static bool NativeGunArmIsRaisedSkinned(RpHAnimHierarchy* hierarchy) {
+    static bool BackupSkinnedSecondArm(RpHAnimHierarchy* hierarchy, SkinnedSecondArmBackup& backup) {
+        backup.valid = false;
+        if (!hierarchy)
+            return false;
+
+        RawHAnimInterpFrame* upper = GetHAnimInterpFrame(hierarchy, BONE_SUPPERARML);
+        RawHAnimInterpFrame* lower = GetHAnimInterpFrame(hierarchy, BONE_SLOWERARML);
+        RawHAnimInterpFrame* hand = GetHAnimInterpFrame(hierarchy, BONE_SLHAND);
+        if (!upper || !lower || !hand)
+            return false;
+
+        backup.upperQ = upper->q;
+        backup.lowerQ = lower->q;
+        backup.handQ = hand->q;
+        backup.valid = true;
+        return true;
+    }
+
+    static void RestoreSkinnedSecondArm(RpHAnimHierarchy* hierarchy, const SkinnedSecondArmBackup& backup) {
+        if (!hierarchy || !backup.valid)
+            return;
+
+        RawHAnimInterpFrame* upper = GetHAnimInterpFrame(hierarchy, BONE_SUPPERARML);
+        RawHAnimInterpFrame* lower = GetHAnimInterpFrame(hierarchy, BONE_SLOWERARML);
+        RawHAnimInterpFrame* hand = GetHAnimInterpFrame(hierarchy, BONE_SLHAND);
+        if (!upper || !lower || !hand)
+            return;
+
+        upper->q = backup.upperQ;
+        lower->q = backup.lowerQ;
+        hand->q = backup.handQ;
+        // Final HAnim matrices are solver output. Rebuild them from the restored local
+        // rotations so no render/fire transaction leaks into later systems or next frame.
+        RpHAnimHierarchyUpdateMatrices(hierarchy);
+    }
+
+    // v14 Skin & Bones visual controller. Do not solve the independently animated
+    // opposite arm. Mirror the COMPLETE final native weapon-arm pose instead, so
+    // forward-walk arm swing cannot participate in the result at all.
+    static float BasisSimilarity(const Basis3& a, const Basis3& b) {
+        return Dot3(a.right, b.right) + Dot3(a.up, b.up) + Dot3(a.at, b.at);
+    }
+
+    static Basis3 BuildProperMirroredBasis(
+        const RwMatrix& nativeMatrix,
+        const RwMatrix& oppositeReference,
+        const CVector& mirrorNormal
+    ) {
+        // Reflecting all three world axes produces an improper (det=-1) basis. A
+        // left/right skeleton also changes local handedness, so flip exactly one
+        // reflected local axis to restore a proper rotation. Pick the axis whose
+        // resulting bind orientation is closest to the real opposite bone. This
+        // avoids hardcoding an Xbox bone-axis convention.
+        const Basis3 nativeBasis = BasisFromRwMatrix(&nativeMatrix);
+        const Basis3 reference = BasisFromRwMatrix(&oppositeReference);
+
+        const CVector rr = ReflectDirection(nativeBasis.right, mirrorNormal);
+        const CVector ru = ReflectDirection(nativeBasis.up, mirrorNormal);
+        const CVector ra = ReflectDirection(nativeBasis.at, mirrorNormal);
+
+        Basis3 candidates[3];
+        candidates[0].right = Scale3(rr, -1.0f); candidates[0].up = ru;                  candidates[0].at = ra;
+        candidates[1].right = rr;                  candidates[1].up = Scale3(ru, -1.0f); candidates[1].at = ra;
+        candidates[2].right = rr;                  candidates[2].up = ru;                  candidates[2].at = Scale3(ra, -1.0f);
+
+        int best = 0;
+        float bestScore = BasisSimilarity(candidates[0], reference);
+        for (int i = 1; i < 3; ++i) {
+            const float score = BasisSimilarity(candidates[i], reference);
+            if (score > bestScore) {
+                bestScore = score;
+                best = i;
+            }
+        }
+        return OrthonormalizeBasis(candidates[best]);
+    }
+
+    static bool MirrorNativeBoneMatrixExact(
+        const RwMatrix& nativeMatrix,
+        const RwMatrix& oppositeReference,
+        const CVector& planePoint,
+        const CVector& mirrorNormal,
+        RwMatrix& out
+    ) {
+        out = oppositeReference; // preserve RenderWare flags/padding from the real bone.
+        const Basis3 basis = BuildProperMirroredBasis(nativeMatrix, oppositeReference, mirrorNormal);
+        const CVector nativePos = Vec3(nativeMatrix.pos.x, nativeMatrix.pos.y, nativeMatrix.pos.z);
+        const CVector mirroredPos = ReflectPointAcrossPlane(nativePos, planePoint, mirrorNormal);
+
+        out.right.x = basis.right.x; out.right.y = basis.right.y; out.right.z = basis.right.z;
+        out.up.x = basis.up.x;       out.up.y = basis.up.y;       out.up.z = basis.up.z;
+        out.at.x = basis.at.x;       out.at.y = basis.at.y;       out.at.z = basis.at.z;
+        out.pos.x = mirroredPos.x;   out.pos.y = mirroredPos.y;   out.pos.z = mirroredPos.z;
+        return IsFiniteRwMatrix(out);
+    }
+
+    static bool RebaseWorldMatrix(const RwMatrix& oldRoot, const RwMatrix& newRoot,
+        const RwMatrix& source, RwMatrix& out) {
+        if (!IsFiniteRwMatrix(oldRoot) || !IsFiniteRwMatrix(newRoot) || !IsFiniteRwMatrix(source))
+            return false;
+
+        const Basis3 oldBasis = BasisFromRwMatrix(&oldRoot);
+        const Basis3 newBasis = BasisFromRwMatrix(&newRoot);
+        const Basis3 sourceBasis = BasisFromRwMatrix(&source);
+
+        Basis3 local;
+        local.right = BasisInverseTransformDirection(oldBasis, sourceBasis.right);
+        local.up = BasisInverseTransformDirection(oldBasis, sourceBasis.up);
+        local.at = BasisInverseTransformDirection(oldBasis, sourceBasis.at);
+        const Basis3 rebased = ComposeBasis(newBasis, OrthonormalizeBasis(local));
+
+        const CVector oldRootPos = Vec3(oldRoot.pos.x, oldRoot.pos.y, oldRoot.pos.z);
+        const CVector newRootPos = Vec3(newRoot.pos.x, newRoot.pos.y, newRoot.pos.z);
+        const CVector sourcePos = Vec3(source.pos.x, source.pos.y, source.pos.z);
+        const CVector localPos = BasisInverseTransformDirection(oldBasis, Sub3(sourcePos, oldRootPos));
+        const CVector rebasedPos = Add3(newRootPos, BasisTransformDirection(newBasis, localPos));
+
+        out = source;
+        out.right.x = rebased.right.x; out.right.y = rebased.right.y; out.right.z = rebased.right.z;
+        out.up.x = rebased.up.x; out.up.y = rebased.up.y; out.up.z = rebased.up.z;
+        out.at.x = rebased.at.x; out.at.y = rebased.at.y; out.at.z = rebased.at.z;
+        out.pos.x = rebasedPos.x; out.pos.y = rebasedPos.y; out.pos.z = rebasedPos.z;
+        return IsFiniteRwMatrix(out);
+    }
+
+    static void InvalidateStableNativeAimPose() {
+        gStableNativeAimPose = StableNativeAimPose();
+        gPoseNativeHandBasisValid = false;
+        gSolvedSecondHandGripValid = false;
+    }
+
+    static bool CaptureStableNativeAimPose(CPed* ped, RpHAnimHierarchy* hierarchy) {
+        if (!ped || !hierarchy)
+            return false;
+        RwMatrix* waist = GetSkinBoneMatrix(hierarchy, BONE_SWAIST);
         RwMatrix* upper = GetSkinBoneMatrix(hierarchy, BONE_SUPPERARMR);
+        RwMatrix* lower = GetSkinBoneMatrix(hierarchy, BONE_SLOWERARMR);
         RwMatrix* hand = GetSkinBoneMatrix(hierarchy, BONE_SRHAND);
-        return upper && hand && hand->pos.z > upper->pos.z - 0.25f;
-    }
-
-    static bool MirrorSkinnedGunArmPose(CPed* ped, RpHAnimHierarchy* hierarchy, float blend) {
-        if (!ped || !hierarchy || blend <= 0.0f)
+        CWeapon* weapon = ped->GetWeapon();
+        if (!waist || !upper || !lower || !hand || !weapon ||
+            !IsFiniteRwMatrix(*waist) || !IsFiniteRwMatrix(*upper) ||
+            !IsFiniteRwMatrix(*lower) || !IsFiniteRwMatrix(*hand))
             return false;
 
-        RwMatrix* nativeUpper = GetSkinBoneMatrix(hierarchy, BONE_SUPPERARMR);
-        RwMatrix* nativeLower = GetSkinBoneMatrix(hierarchy, BONE_SLOWERARMR);
-        RwMatrix* nativeHand = GetSkinBoneMatrix(hierarchy, BONE_SRHAND);
-        RwMatrix* mirrorUpper = GetSkinBoneMatrix(hierarchy, BONE_SUPPERARML);
-        RwMatrix* mirrorLower = GetSkinBoneMatrix(hierarchy, BONE_SLOWERARML);
-        RwMatrix* mirrorHand = GetSkinBoneMatrix(hierarchy, BONE_SLHAND);
-        if (!nativeUpper || !nativeLower || !nativeHand || !mirrorUpper || !mirrorLower || !mirrorHand)
-            return false;
-
-        const CVector nativeShoulder = Vec3(nativeUpper->pos.x, nativeUpper->pos.y, nativeUpper->pos.z);
-        const CVector nativeElbow = Vec3(nativeLower->pos.x, nativeLower->pos.y, nativeLower->pos.z);
-        const CVector nativeHandPos = Vec3(nativeHand->pos.x, nativeHand->pos.y, nativeHand->pos.z);
-        const CVector mirrorShoulder = Vec3(mirrorUpper->pos.x, mirrorUpper->pos.y, mirrorUpper->pos.z);
-        CVector mirrorElbow = Vec3(mirrorLower->pos.x, mirrorLower->pos.y, mirrorLower->pos.z);
-        CVector mirrorHandPos = Vec3(mirrorHand->pos.x, mirrorHand->pos.y, mirrorHand->pos.z);
-
-        const CVector mirrorNormal = Normalize3(ped->GetRight(), Vec3(1.0f, 0.0f, 0.0f));
-
-        const CVector currentUpperDir = Sub3(mirrorElbow, mirrorShoulder);
-        const CVector reflectedUpperDir = ReflectDirection(Sub3(nativeElbow, nativeShoulder), mirrorNormal);
-        const CVector targetUpperDir = BlendDirection(currentUpperDir, reflectedUpperDir, blend);
-        const AxisRotation upperRot = MakeAxisRotation(currentUpperDir, targetUpperDir, BasisFromRwMatrix(mirrorUpper));
-
-        ApplyAxisRotationToMatrix(*mirrorUpper, mirrorShoulder, upperRot);
-        ApplyAxisRotationToMatrix(*mirrorLower, mirrorShoulder, upperRot);
-        ApplyAxisRotationToMatrix(*mirrorHand, mirrorShoulder, upperRot);
-
-        mirrorElbow = Vec3(mirrorLower->pos.x, mirrorLower->pos.y, mirrorLower->pos.z);
-        mirrorHandPos = Vec3(mirrorHand->pos.x, mirrorHand->pos.y, mirrorHand->pos.z);
-        const CVector currentLowerDir = Sub3(mirrorHandPos, mirrorElbow);
-        const CVector reflectedLowerDir = ReflectDirection(Sub3(nativeHandPos, nativeElbow), mirrorNormal);
-        const CVector targetLowerDir = BlendDirection(currentLowerDir, reflectedLowerDir, blend);
-        const AxisRotation lowerRot = MakeAxisRotation(currentLowerDir, targetLowerDir, BasisFromRwMatrix(mirrorLower));
-
-        ApplyAxisRotationToMatrix(*mirrorLower, mirrorElbow, lowerRot);
-        ApplyAxisRotationToMatrix(*mirrorHand, mirrorElbow, lowerRot);
-        return IsFiniteRwMatrix(*mirrorUpper) && IsFiniteRwMatrix(*mirrorLower) && IsFiniteRwMatrix(*mirrorHand);
+        gStableNativeAimPose.valid = true;
+        gStableNativeAimPose.owner = ped;
+        gStableNativeAimPose.clump = ped->m_pRwClump;
+        gStableNativeAimPose.weaponType = weapon->m_eWeaponType;
+        gStableNativeAimPose.frame = CTimer::m_FrameCounter;
+        gStableNativeAimPose.waist = *waist;
+        gStableNativeAimPose.upper = *upper;
+        gStableNativeAimPose.lower = *lower;
+        gStableNativeAimPose.hand = *hand;
+        return true;
     }
 
-    static bool ApplyCurrentMirror(CPed* ped, bool refreshSkinnedHierarchy, float* outBlend = 0) {
+    static bool GetStableNativeAimSource(CPed* ped, RpHAnimHierarchy* hierarchy,
+        RwMatrix& upper, RwMatrix& lower, RwMatrix& hand) {
+        if (!ped || !hierarchy)
+            return false;
+
+        RwMatrix* currentWaist = GetSkinBoneMatrix(hierarchy, BONE_SWAIST);
+        RwMatrix* currentUpper = GetSkinBoneMatrix(hierarchy, BONE_SUPPERARMR);
+        RwMatrix* currentLower = GetSkinBoneMatrix(hierarchy, BONE_SLOWERARMR);
+        RwMatrix* currentHand = GetSkinBoneMatrix(hierarchy, BONE_SRHAND);
+        CWeapon* weapon = ped->GetWeapon();
+        if (!currentWaist || !currentUpper || !currentLower || !currentHand || !weapon)
+            return false;
+
+        const unsigned int frame = CTimer::m_FrameCounter;
+        const bool verifiedNativeAimThisFrame = gLastNativeAimGunFrame == frame;
+
+        // A pose is only admitted to the cache on a frame where GTA actually executed
+        // CPed::AimGun. This is the critical difference from v14: a forward-walk frame
+        // whose SetMoveAnim cleared the aim flag can never become the twin-arm source.
+        // Do NOT reject low aim by testing hand.z against shoulder.z. GTA III's native
+        // gun IK legitimately moves the weapon hand below the shoulder when pitching
+        // down. gLastNativeAimGunFrame is the authoritative proof that this is a real
+        // AimGun result, regardless of elevation.
+        if (verifiedNativeAimThisFrame) {
+            if (CaptureStableNativeAimPose(ped, hierarchy)) {
+                upper = *currentUpper;
+                lower = *currentLower;
+                hand = *currentHand;
+                gPoseNativeHandBasis = hand;
+                gPoseNativeHandBasisValid = true;
+                return true;
+            }
+        }
+
+        const unsigned int maxAge = static_cast<unsigned int>(gConfig.aimHoldFrames + 3);
+        if (!gStableNativeAimPose.valid || gStableNativeAimPose.owner != ped ||
+            gStableNativeAimPose.clump != ped->m_pRwClump ||
+            gStableNativeAimPose.weaponType != weapon->m_eWeaponType ||
+            frame - gStableNativeAimPose.frame > maxAge || !IsFiniteRwMatrix(*currentWaist))
+            return false;
+
+        // Rebase the last VERIFIED aiming pose through the current waist transform.
+        // Claude can translate/turn with locomotion, but the walk animation is never
+        // allowed to supply the opposite weapon-arm bend on a skipped AimGun frame.
+        if (!RebaseWorldMatrix(gStableNativeAimPose.waist, *currentWaist, gStableNativeAimPose.upper, upper) ||
+            !RebaseWorldMatrix(gStableNativeAimPose.waist, *currentWaist, gStableNativeAimPose.lower, lower) ||
+            !RebaseWorldMatrix(gStableNativeAimPose.waist, *currentWaist, gStableNativeAimPose.hand, hand))
+            return false;
+
+        ++gCachedAimPoseUses;
+        gPoseNativeHandBasis = hand;
+        gPoseNativeHandBasisValid = true;
+        return true;
+    }
+
+    static void CopyRwBasis(const RwMatrix& source, RwMatrix& destination) {
+        destination.right.x = source.right.x; destination.right.y = source.right.y; destination.right.z = source.right.z;
+        destination.up.x = source.up.x;       destination.up.y = source.up.y;       destination.up.z = source.up.z;
+        destination.at.x = source.at.x;       destination.at.y = source.at.y;       destination.at.z = source.at.z;
+    }
+
+    static void WriteBasisToRwMatrix(const Basis3& basis, RwMatrix& destination) {
+        destination.right.x = basis.right.x; destination.right.y = basis.right.y; destination.right.z = basis.right.z;
+        destination.up.x = basis.up.x;       destination.up.y = basis.up.y;       destination.up.z = basis.up.z;
+        destination.at.x = basis.at.x;       destination.at.y = basis.at.y;       destination.at.z = basis.at.z;
+    }
+
+    static bool StabilizeSkinnedSecondHandToNativeWeapon(
+        CPed* ped,
+        RpHAnimHierarchy* hierarchy,
+        const RwMatrix& nativeHandSource,
+        float blend
+    ) {
+        if (!ped || !hierarchy || blend <= 0.001f)
+            return false;
+
+        RawHAnimInterpFrame* handInterp = GetHAnimInterpFrame(hierarchy, BONE_SLHAND);
+        RwMatrix* secondLower = GetSkinBoneMatrix(hierarchy, BONE_SLOWERARML);
+        RwMatrix* secondHand = GetSkinBoneMatrix(hierarchy, BONE_SLHAND);
+        if (!handInterp || !secondLower || !secondHand || !IsFiniteRwMatrix(nativeHandSource))
+            return false;
+
+        CVector localFireDir;
+        if (!GetActiveWeaponLocalFireDirection(ped, localFireDir))
+            return false;
+
+        // First align the actual duplicate weapon's barrel direction. The duplicate
+        // weapon transform includes the bind-pose grip correction; do not align raw
+        // SLhand axes and then hope the asymmetric pistol model follows them.
+        RwMatrix gripWorld;
+        if (!BuildOppositeGripWorld(ped, hierarchy, nativeHandSource, *secondHand, gripWorld))
+            return false;
+
+        const CVector desiredForward = Normalize3(
+            BasisTransformDirection(BasisFromRwMatrix(&nativeHandSource), localFireDir),
+            Vec3(0.0f, 1.0f, 0.0f));
+        const CVector currentForward = Normalize3(
+            BasisTransformDirection(BasisFromRwMatrix(&gripWorld), localFireDir),
+            desiredForward);
+
+        float forwardDot = ClampFloat(Dot3(currentForward, desiredForward), -1.0f, 1.0f);
+        if (forwardDot < 0.99995f) {
+            CVector axisWorld = Cross3(currentForward, desiredForward);
+            float axisLenSq = Dot3(axisWorld, axisWorld);
+            if (axisLenSq < 1.0e-8f) {
+                axisWorld = Cross3(currentForward,
+                    Vec3(secondLower->up.x, secondLower->up.y, secondLower->up.z));
+                axisLenSq = Dot3(axisWorld, axisWorld);
+                if (axisLenSq < 1.0e-8f) {
+                    axisWorld = Cross3(currentForward,
+                        Vec3(secondLower->right.x, secondLower->right.y, secondLower->right.z));
+                    axisLenSq = Dot3(axisWorld, axisWorld);
+                }
+            }
+            if (axisLenSq > 1.0e-8f) {
+                axisWorld = Scale3(axisWorld, 1.0f / std::sqrt(axisLenSq));
+                const CVector axisLocal = WorldAxisToParentLocal(axisWorld, *secondLower);
+                float radians = std::acos(forwardDot) * ClampFloat(blend * gConfig.handAimBlend, 0.0f, 1.0f);
+                const float limit = gConfig.handAimLimitDeg * 0.01745329251994329577f;
+                if (limit > 0.0f && radians > limit)
+                    radians = limit;
+                RwV3d rwAxis = { axisLocal.x, axisLocal.y, axisLocal.z };
+                RtQuatRotate(&handInterp->q, &rwAxis,
+                    radians * 57.29577951308232f, rwCOMBINEPRECONCAT);
+                if (!RpHAnimHierarchyUpdateMatrices(hierarchy))
+                    return false;
+            }
+        }
+
+        // Then match roll around the common barrel axis. Re-read the solved hand and
+        // grip after the forward correction so this is one coherent local-quaternion
+        // solve, not a world-matrix overwrite of the wrist after the fact.
+        handInterp = GetHAnimInterpFrame(hierarchy, BONE_SLHAND);
+        secondLower = GetSkinBoneMatrix(hierarchy, BONE_SLOWERARML);
+        secondHand = GetSkinBoneMatrix(hierarchy, BONE_SLHAND);
+        if (!handInterp || !secondLower || !secondHand ||
+            !BuildOppositeGripWorld(ped, hierarchy, nativeHandSource, *secondHand, gripWorld))
+            return false;
+
+        if (gConfig.stabilizeSecondHandRoll) {
+            const CVector axis = desiredForward;
+            const Basis3 nativeBasis = BasisFromRwMatrix(&nativeHandSource);
+            const Basis3 gripBasis = BasisFromRwMatrix(&gripWorld);
+            const CVector nativeReference = ProjectDirectionOntoPlane(nativeBasis.up, axis,
+                ProjectDirectionOntoPlane(nativeBasis.right, axis, Vec3(1.0f, 0.0f, 0.0f)));
+            const CVector gripReference = ProjectDirectionOntoPlane(gripBasis.up, axis,
+                ProjectDirectionOntoPlane(gripBasis.right, axis, nativeReference));
+
+            const float c = ClampFloat(Dot3(gripReference, nativeReference), -1.0f, 1.0f);
+            const float sign = Dot3(Cross3(gripReference, nativeReference), axis);
+            float radians = std::atan2(sign, c) * ClampFloat(blend * gConfig.handRollBlend, 0.0f, 1.0f);
+            const float limit = gConfig.handRollLimitDeg * 0.01745329251994329577f;
+            if (limit > 0.0f) {
+                if (radians > limit) radians = limit;
+                if (radians < -limit) radians = -limit;
+            }
+
+            if (std::fabs(radians) > 1.0e-5f) {
+                const CVector axisLocal = WorldAxisToParentLocal(axis, *secondLower);
+                RwV3d rwAxis = { axisLocal.x, axisLocal.y, axisLocal.z };
+                RtQuatRotate(&handInterp->q, &rwAxis,
+                    radians * 57.29577951308232f, rwCOMBINEPRECONCAT);
+                if (!RpHAnimHierarchyUpdateMatrices(hierarchy))
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    // v21 Skin & Bones controller: copy the successful VC geometry exactly at the
+    // segment level, but keep the GTA III-specific continuity and bind-socket fixes.
+    //
+    // Important: the opposite shoulder must NOT inherit the native upper-arm direction
+    // unchanged. The native direction contains a lateral component appropriate to the
+    // native shoulder. Reusing it on the opposite shoulder makes the arm curl inward.
+    // Reflecting that direction across the ped sagittal plane flips only the lateral
+    // component, producing the Max-Payne/VC-style symmetric forward firing pose.
+    static bool SolveSkinnedSecondArmLocalHAnim(
+        CPed* ped,
+        RpHAnimHierarchy* hierarchy,
+        const RwMatrix& nativeUpperSource,
+        const RwMatrix& nativeLowerSource,
+        const RwMatrix& nativeHandSource,
+        float blend
+    ) {
+        if (!ped || !hierarchy || blend <= 0.001f ||
+            !IsFiniteRwMatrix(nativeUpperSource) || !IsFiniteRwMatrix(nativeLowerSource) ||
+            !IsFiniteRwMatrix(nativeHandSource))
+            return false;
+
+        if (!RpHAnimHierarchyUpdateMatrices(hierarchy))
+            return false;
+
+        const CVector nativeShoulder = Vec3(
+            nativeUpperSource.pos.x, nativeUpperSource.pos.y, nativeUpperSource.pos.z);
+        const CVector nativeElbow = Vec3(
+            nativeLowerSource.pos.x, nativeLowerSource.pos.y, nativeLowerSource.pos.z);
+        const CVector nativeHandPos = Vec3(
+            nativeHandSource.pos.x, nativeHandSource.pos.y, nativeHandSource.pos.z);
+
+        RwMatrix* secondUpper = GetSkinBoneMatrix(hierarchy, BONE_SUPPERARML);
+        if (!secondUpper)
+            return false;
+
+        const CVector secondShoulder = Vec3(
+            secondUpper->pos.x, secondUpper->pos.y, secondUpper->pos.z);
+
+        // Same mirror plane convention used by the VC revision and the original v3 III
+        // controller: plane normal is the ped's right axis. Fall back to the live
+        // shoulder-to-shoulder axis if a mod has left the entity basis degenerate.
+        const CVector shoulderAxis = Normalize3(
+            Sub3(nativeShoulder, secondShoulder),
+            Vec3(1.0f, 0.0f, 0.0f));
+        const CVector mirrorNormal = Normalize3(
+            ped->GetRight(),
+            shoulderAxis);
+
+        const CVector nativeUpperDir = Normalize3(
+            Sub3(nativeElbow, nativeShoulder),
+            Vec3(0.0f, 1.0f, 0.0f));
+        const CVector nativeLowerDir = Normalize3(
+            Sub3(nativeHandPos, nativeElbow),
+            nativeUpperDir);
+
+        CVector desiredUpperDir = Normalize3(
+            ReflectDirection(nativeUpperDir, mirrorNormal),
+            nativeUpperDir);
+        const CVector desiredLowerDir = Normalize3(
+            ReflectDirection(nativeLowerDir, mirrorNormal),
+            nativeLowerDir);
+
+        // Optional EXTRA flare after the true mirror. Default is zero because the mirror
+        // already supplies the outward elbow arch that VC gets naturally. This remains
+        // available only as a small taste adjustment.
+        if (gConfig.elbowOutwardDeg > 0.001f) {
+            const CVector outward = Normalize3(
+                Sub3(secondShoulder, nativeShoulder),
+                Scale3(mirrorNormal, -1.0f));
+            const float maxRadians = gConfig.elbowOutwardDeg * 0.01745329251994329577f;
+            const float d = ClampFloat(Dot3(desiredUpperDir, outward), -1.0f, 1.0f);
+            const float angle = std::acos(d);
+            if (angle > 1.0e-5f) {
+                CVector axis = Cross3(desiredUpperDir, outward);
+                const float axisLen = Length3(axis);
+                if (axisLen > 1.0e-5f) {
+                    axis = Scale3(axis, 1.0f / axisLen);
+                    const float radians = (angle < maxRadians) ? angle : maxRadians;
+                    desiredUpperDir = Normalize3(
+                        RotateAroundAxis(desiredUpperDir, axis,
+                            std::cos(radians), std::sin(radians)),
+                        desiredUpperDir);
+                }
+            }
+        }
+
+        // Match the proven VC limits rather than v20's much looser 1.50/1.70 rad caps.
+        // These are caps only; at blend=1 the solver still reaches the reflected target
+        // whenever the required correction lies inside the normal firing range.
+        if (!RotateSkinnedBoneTowardDirection(
+            hierarchy, BONE_SUPPERARML, 8, BONE_SLOWERARML,
+            desiredUpperDir, blend, 0.95f))
+            return false;
+
+        if (!RotateSkinnedBoneTowardDirection(
+            hierarchy, BONE_SLOWERARML, BONE_SUPPERARML, BONE_SLHAND,
+            desiredLowerDir, blend, 1.10f))
+            return false;
+
+        // Keep v19/v20's GTA III-specific grip solution. The VC lesson being copied here
+        // is the arm geometry; the bind-derived socket is still safer for Skin & Bones.
+        if (!StabilizeSkinnedSecondHandToNativeWeapon(
+            ped, hierarchy, nativeHandSource, blend))
+            return false;
+
+        RwMatrix* secondHand = GetSkinBoneMatrix(hierarchy, BONE_SLHAND);
+        if (!secondHand ||
+            !BuildOppositeGripWorld(ped, hierarchy, nativeHandSource, *secondHand,
+                gSolvedSecondHandGrip))
+            return false;
+
+        gSolvedSecondHandGripValid = true;
+        return true;
+    }
+
+    static bool PrepareTemporarySkinnedSecondArmPose(
+        CPed* ped,
+        RpHAnimHierarchy*& hierarchy,
+        SkinnedSecondArmBackup& backup,
+        float& blend
+    ) {
+        hierarchy = 0;
+        blend = 0.0f;
+        gPoseNativeHandBasisValid = false;
+        gSolvedSecondHandGripValid = false;
+        if (!gConfig.leftArmIK || !IsEligiblePlayer(ped) || !GetSkinnedPedHierarchy(ped, hierarchy))
+            return false;
+
+        if (!RpHAnimHierarchyUpdateMatrices(hierarchy))
+            return false;
+        if (!BackupSkinnedSecondArm(hierarchy, backup))
+            return false;
+        if (!ShouldMirrorAimPose(ped, blend)) {
+            RestoreSkinnedSecondArm(hierarchy, backup);
+            backup.valid = false;
+            return false;
+        }
+
+        RwMatrix nativeUpperSource, nativeLowerSource, nativeHandSource;
+        if (!GetStableNativeAimSource(ped, hierarchy, nativeUpperSource, nativeLowerSource, nativeHandSource) ||
+            !SolveSkinnedSecondArmLocalHAnim(ped, hierarchy, nativeUpperSource, nativeLowerSource, nativeHandSource, blend)) {
+            RestoreSkinnedSecondArm(hierarchy, backup);
+            backup.valid = false;
+            gPoseNativeHandBasisValid = false;
+            gSolvedSecondHandGripValid = false;
+            return false;
+        }
+        return true;
+    }
+
+    static bool ApplyCurrentMirror(CPed* ped, float* outBlend = 0) {
         if (outBlend)
             *outBlend = 0.0f;
         if (!gConfig.leftArmIK || !IsEligiblePlayer(ped))
@@ -1196,16 +2669,8 @@ namespace DualWieldIII {
 
         RpHAnimHierarchy* hierarchy = 0;
         if (GetSkinnedPedHierarchy(ped, hierarchy)) {
-            // Skin & Bones changes interpolation quaternions in its replacement IK. During
-            // ProcessControl the matrix array can still contain the previous pose, so the
-            // fire path explicitly materializes it before deriving the second muzzle.
-            if (refreshSkinnedHierarchy) {
-                if (!RpHAnimHierarchyUpdateMatrices(hierarchy))
-                    return false;
-            }
-
             float blend = 0.0f;
-            if (!ShouldMirrorAimPose(ped, NativeGunArmIsRaisedSkinned(hierarchy), blend))
+            if (!ShouldMirrorAimPose(ped, blend))
                 return false;
             if (!MirrorSkinnedGunArmPose(ped, hierarchy, blend))
                 return false;
@@ -1218,7 +2683,9 @@ namespace DualWieldIII {
         if (!CaptureMirroredArmChain(ped, chain))
             return false;
         float blend = 0.0f;
-        if (!ShouldMirrorAimPose(ped, NativeGunArmIsRaised(chain), blend))
+        // Aim elevation is not a validity test. In particular, downward aim can put the
+        // native hand well below its shoulder while the pose is still a valid gun pose.
+        if (!ShouldMirrorAimPose(ped, blend))
             return false;
         MirrorNativeGunArmPose(ped, chain, blend);
         if (outBlend)
@@ -1226,22 +2693,86 @@ namespace DualWieldIII {
         return true;
     }
 
-    static void ApplyRenderStageMirror(CPed* ped) {
-        float blend = 0.0f;
-        if (!ApplyCurrentMirror(ped, false, &blend))
+    static void ApplySecondArmPosePass(CPed* ped, bool lateRepair) {
+        if (!ped)
             return;
+
+        if (!WantsSecondArmPose(ped))
+            return;
+
+        const unsigned int frame = CTimer::m_FrameCounter;
+        unsigned int& lastFrame = lateRepair ? gLastLateRepairPoseFrame : gLastPostAimPoseFrame;
+        if (lastFrame == frame)
+            return;
+
+        float blend = 0.0f;
+        if (!ApplyCurrentMirror(ped, &blend))
+            return;
+
+        lastFrame = frame;
+        if (lateRepair)
+            ++gLateRepairPoseHits;
+        else
+            ++gPostAimPoseHits;
+
         if (gLeft.owner == ped)
             UpdateLeftWeaponWorldTransform();
+        UpdateDualWieldState(ped, ped ? ped->GetWeapon() : 0, 0, false);
+        MaybeLogHandState();
+
+        bool& logged = lateRepair ? gLoggedFirstLateRepairPose : gLoggedFirstPostAimPose;
+        if (!logged) {
+            RpHAnimHierarchy* hierarchy = 0;
+            const bool skinned = GetSkinnedPedHierarchy(ped, hierarchy);
+            char line[448];
+            std::snprintf(line, sizeof(line),
+                "DualWieldIII: %s local arm correction active mode=%s blend=%.2f hierarchy=%p handStabilize=%d.",
+                lateRepair ? "post-CGame repair" : "post-AimGun early",
+                skinned ? "Skin&Bones/HAnim-render-space" : "stock/RwFrame-local",
+                blend, hierarchy, gConfig.stabilizeSecondHand ? 1 : 0);
+            Log(line);
+            logged = true;
+        }
+    }
+
+    static void ApplyPostAimSecondArmPose(CPed* ped) {
+        // Early pass is still required: CPed::Attack happens later in the same ped
+        // control path and must sample a corrected current-frame opposite-hand muzzle.
+        ApplySecondArmPosePass(ped, false);
+    }
+
+    static void ApplyLateProcessSecondArmPose(CPed* ped) {
+        if (!gConfig.lateProcessRepair || IsSkinnedPed(ped))
+            return;
+
+        // GTA III 1.0 EN IDB:
+        //   CPlayerPed::ProcessControl 0x4EFD90
+        //     0x4EFE50 -> CPed::ProcessControl
+        //     0x4F03A2 -> SetRealMoveAnim
+        //     0x4F048D -> ProcessAnimGroups (can ReApplyMoveAnims)
+        // Plugin-SDK's gameProcessEvent is AFTER the CGame::Process call at 0x48E49B.
+        // Optional compatibility pass for a third-party controller that changes the
+        // skeleton again after the normal player process. Off by default to avoid applying
+        // a second delta to the same fresh animation pose.
+        ApplySecondArmPosePass(ped, true);
     }
 
     static void PrepareOppositePoseForFire(CPed* ped) {
-        if (!ped || !gConfig.leftArmIK)
+        if (!ped || gLeft.owner != ped)
             return;
-        if (ApplyCurrentMirror(ped, true, 0) && gLeft.owner == ped)
-            UpdateLeftWeaponWorldTransform();
+
+        // Skin & Bones is handled transactionally inside ComputeLeftFireSource: backup
+        // clean local HAnim quaternions -> solve/rebuild -> sample helper/muzzle ->
+        // restore/rebuild. Nothing procedural survives the fire transaction.
+        if (gLeft.skinnedSource)
+            return;
+
+        if (gLastPostAimPoseFrame != CTimer::m_FrameCounter && WantsSecondArmPose(ped))
+            ApplySecondArmPosePass(ped, false);
+        UpdateLeftWeaponWorldTransform();
     }
 
-    static void RenderStandaloneLeftWeapon(CPed* ped) {
+    static void RenderStandaloneLeftWeapon(CPed* ped, bool transformAlreadyPrepared = false) {
         if (!ped || !IsEligiblePlayer(ped) || gLeft.owner != ped || !IsAtomicAliveForOwner(ped))
             return;
 
@@ -1253,14 +2784,14 @@ namespace DualWieldIII {
             }
         }
         else {
-            RwFrame* currentHand = GetPedFrameSafe(ped, 5);
+            RwFrame* currentHand = GetPedFrameSafe(ped, PED_FRAME_SECOND_HAND);
             if (!currentHand || currentHand != gLeft.sourceHandFrame) {
                 DestroyLeftWeapon();
                 return;
             }
         }
 
-        if (!UpdateLeftWeaponWorldTransform())
+        if (!transformAlreadyPrepared && !UpdateLeftWeaponWorldTransform())
             return;
 
         // Standalone atomic: no RpClumpAddAtomic, no HAnim ownership ambiguity. Its own
@@ -1269,41 +2800,46 @@ namespace DualWieldIII {
         RpAtomicRender(gLeft.atomic);
     }
 
-    static bool ComputeLeftFireSource(CPed* ped, CWeapon* weapon, CVector& out) {
+    static bool ComputeLeftFireSource(CPed* ped, CWeapon* weapon, const CVector* nativeMuzzle, CVector& out) {
         if (!ped || !weapon || gLeft.owner != ped || !gLeft.helperFrame)
             return false;
 
-        CWeaponInfo* info = CWeaponInfo::GetWeaponInfo(weapon->m_eWeaponType);
-        if (!info)
+        if (gLeft.skinnedSource) {
+            RpHAnimHierarchy* hierarchy = 0;
+            SkinnedSecondArmBackup backup;
+            float blend = 0.0f;
+            const bool posed = PrepareTemporarySkinnedSecondArmPose(ped, hierarchy, backup, blend);
+            if (!posed)
+                return false;
+
+            const bool weaponOk = UpdateLeftWeaponWorldTransform();
+            RwMatrix weaponWorld;
+            bool muzzleOk = false;
+            if (weaponOk) {
+                RwMatrix* helper = RwFrameGetMatrix(gLeft.helperFrame);
+                CWeaponInfo* info = CWeaponInfo::GetWeaponInfo(weapon->m_eWeaponType);
+                if (helper && info && IsFiniteRwMatrix(*helper)) {
+                    weaponWorld = *helper;
+                    muzzleOk = ComputeMuzzleFromWeaponWorld(info, weaponWorld, out) && IsMuzzleSaneForPed(ped, out);
+                }
+            }
+
+            // Fire sampling must not leave a procedural body pose behind. The helper
+            // keeps the solved weapon matrix/muzzle, while the backed-up local HAnim
+            // quaternions are restored and the normal matrix array is rebuilt.
+            RestoreSkinnedSecondArm(hierarchy, backup);
+            gPoseNativeHandBasisValid = false;
+            gSolvedSecondHandGripValid = false;
+            return muzzleOk;
+        }
+
+        if (!UpdateDualWieldState(ped, weapon, nativeMuzzle, true))
+            return false;
+        if (!gDualState.secondHand.muzzleValid)
             return false;
 
-        // Make the muzzle source use the exact same corrected transform that is used
-        // to render the second weapon. This is refreshed here so firing cannot use a
-        // previous-frame pose after IK modified the opposite arm.
-        if (!UpdateLeftWeaponWorldTransform())
-            return false;
-        RwMatrix* world = RwFrameGetMatrix(gLeft.helperFrame);
-        if (!world)
-            return false;
-
-        RwV3d src = { info->m_vecFireOffset.x, info->m_vecFireOffset.y, info->m_vecFireOffset.z };
-        RwV3d dst = {};
-        RwV3dTransformPoints(&dst, &src, 1, world);
-        out.x = dst.x;
-        out.y = dst.y;
-        out.z = dst.z;
-        if (!IsFiniteVector(out))
-            return false;
-
-        // A corrupt/rebuilt frame should never be allowed to send a bullet, point light
-        // or particle system to infinity/origin. A one-handed gun muzzle must stay close
-        // to the player; 3 metres is intentionally generous for modded player models.
-        const CVector& pedPos = ped->GetPosition();
-        const float dx = out.x - pedPos.x;
-        const float dy = out.y - pedPos.y;
-        const float dz = out.z - pedPos.z;
-        const float distSq = dx * dx + dy * dy + dz * dz;
-        return IsFiniteFloat(distSq) && distSq <= 9.0f;
+        out = gDualState.secondHand.muzzle;
+        return true;
     }
 
     // Replaces only the CALL at CPed::Attack+0x31F, not CWeapon::Fire globally.
@@ -1314,6 +2850,9 @@ namespace DualWieldIII {
             return false;
 
         const bool firedRight = fireFn(weapon, shooter, rightSource);
+        if (firedRight) {
+            gDualState.fireRightThisFrame = true;
+        }
         if (!firedRight || !gConfig.doubleShot || !shooter || !weapon)
             return firedRight;
 
@@ -1329,15 +2868,36 @@ namespace DualWieldIII {
         if (weapon->m_nAmmoInClip <= 0)
             return firedRight;
 
-        // Materialize the Skin & Bones hierarchy when needed, mirror the finished native
-        // arm pose, then rebuild the private weapon frame before deriving the second muzzle.
+        // The opposite arm is normally authored beside native AimGun. The fire hook only
+        // invokes the guarded fallback if that stage did not run this frame, then derives
+        // the muzzle from the actual controlled second-hand weapon transform.
         PrepareOppositePoseForFire(ped);
 
         CVector leftSource;
-        if (!ComputeLeftFireSource(ped, weapon, leftSource))
+        if (!ComputeLeftFireSource(ped, weapon, rightSource, leftSource))
             return firedRight;
 
-        fireFn(weapon, shooter, &leftSource);
+        gDualState.fireRightThisFrame = true;
+        gDualState.fireLeftThisFrame = true;
+        ++gSecondShotAttempts;
+        const bool firedLeft = fireFn(weapon, shooter, &leftSource);
+        if (firedLeft) {
+            ++gSecondShotSuccess;
+
+            // Do NOT add a manual flash here. GTA III FireInstantHit uses fireSource for
+            // CPointLights::AddLight, GUNFLASH_NOANIM, GUNSMOKE2 and AddGunshell for
+            // both Colt .45 and Uzi. A successful second native Fire therefore already
+            // produces the complete stock muzzle package at this leftSource.
+            if (!gLoggedFirstSecondShot) {
+                char line[320];
+                std::snprintf(line, sizeof(line),
+                    "DualWieldIII: second native shot succeeded at muzzle %.3f %.3f %.3f; native flash/smoke/light/shell path active.",
+                    leftSource.x, leftSource.y, leftSource.z);
+                Log(line);
+                gLoggedFirstSecondShot = true;
+            }
+        }
+
         return firedRight;
     }
 
@@ -1362,7 +2922,7 @@ namespace DualWieldIII {
 
         const DWORD prot = mbi.Protect & 0xFFu;
         return prot == PAGE_EXECUTE || prot == PAGE_EXECUTE_READ ||
-               prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
+            prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY;
     }
 
     static bool InstallCallPatch(uintptr_t address, uintptr_t expectedTarget, void* hook, CallPatch& patch) {
@@ -1426,20 +2986,159 @@ namespace DualWieldIII {
         patch = CallPatch();
     }
 
-    static void __fastcall PedRenderBridge(CPed* ped, void*) {
-        // The bridge is installed on CPed::Render's final CALL. Apply the mirror
-        // first so whichever renderer currently owns the call site (stock, Skin & Bones,
-        // Proper Shaders bridge, etc.) sees the completed opposite-arm pose.
-        ApplyRenderStageMirror(ped);
+    static bool ShouldPreserveMoveAimFlag(CPed* ped) {
+        if (!ped || !IsEligiblePlayer(ped))
+            return false;
+        CWeapon* weapon = ped->GetWeapon();
+        if (!weapon || weapon->m_eWeaponState == WEAPONSTATE_RELOADING ||
+            weapon->m_eWeaponState == WEAPONSTATE_OUT_OF_AMMO)
+            return false;
 
+        CPad* pad = CPad::GetPad(0);
+        const bool heldInput = pad && (pad->GetTarget() || pad->GetWeapon());
+        return heldInput || ped->bIsAimingGun || ped->bIsPointingGunAt || ped->bIsShooting ||
+            weapon->m_eWeaponState == WEAPONSTATE_FIRING || ped->m_ePedState == PEDSTATE_ATTACK;
+    }
+
+    static void __fastcall MoveAnimClearAimHook(CPed* ped, void*) {
+        PedClearAimFn previous = reinterpret_cast<PedClearAimFn>(
+            gMoveClearAimPatch.previousTarget ? gMoveClearAimPatch.previousTarget : ADDR_PED_CLEAR_AIM);
+
+        // GTA III CPed::SetMoveAnim calls ClearAimFlag at 0x4C5BF3 specifically for
+        // move states 2/3/4. With target/fire held that can make CPed::ProcessControl's
+        // later 0x4CB037 AimGun gate miss alternating forward-walk frames. Preserve the
+        // flag only for an eligible dual-wield player who is actively targeting/firing.
+        if (ShouldPreserveMoveAimFlag(ped)) {
+            ++gMoveAimClearSuppressions;
+            gAimIntentHoldRemaining = gConfig.aimHoldFrames;
+            gAimIntentLatched = true;
+            return;
+        }
+
+        if (previous && reinterpret_cast<uintptr_t>(previous) != reinterpret_cast<uintptr_t>(&MoveAnimClearAimHook))
+            previous(ped);
+    }
+
+    static bool EnsureMoveAimContinuityBridgeInstalled() {
+        const uintptr_t hookTarget = reinterpret_cast<uintptr_t>(&MoveAnimClearAimHook);
+        uintptr_t currentTarget = 0;
+        int32_t currentRel = 0;
+        if (!DecodeRelativeCall(ADDR_MOVE_CLEAR_AIM_CALL, currentTarget, currentRel))
+            return false;
+        if (currentTarget == hookTarget)
+            return true;
+        if (gMoveClearAimPatch.installed)
+            return false;
+        if (!InstallCallPatch(ADDR_MOVE_CLEAR_AIM_CALL, ADDR_PED_CLEAR_AIM,
+            reinterpret_cast<void*>(&MoveAnimClearAimHook), gMoveClearAimPatch))
+            return false;
+
+        char line[320];
+        std::snprintf(line, sizeof(line),
+            "DualWieldIII: forward-move aim continuity bridge active at 0x4C5BF3. previous=%p%s.",
+            reinterpret_cast<void*>(gMoveClearAimPatch.previousTarget),
+            gMoveClearAimPatch.chained ? " [CHAINED]" : "");
+        Log(line);
+        return true;
+    }
+
+    static void __fastcall PedAimGunHook(CPed* ped, void*) {
+        // Let GTA/Skin & Bones finish the normal animation and native gun-arm IK first.
+        // The opposite arm is corrected once from that fresh current-frame pose below.
+        PedAimGunFn previous = reinterpret_cast<PedAimGunFn>(
+            gAimPatch.previousTarget ? gAimPatch.previousTarget : ADDR_PED_AIMGUN);
+        if (previous && reinterpret_cast<uintptr_t>(previous) != reinterpret_cast<uintptr_t>(&PedAimGunHook))
+            previous(ped);
+
+        if (ped && IsEligiblePlayer(ped))
+            gLastNativeAimGunFrame = CTimer::m_FrameCounter;
+
+        // Stock PC skeleton keeps the old local-frame path. Skin & Bones/Xbox does NOT
+        // receive a quaternion correction here anymore; v13 solves its final matrix pose
+        // transactionally at fire sampling and immediately before rendering.
+        if (!IsSkinnedPed(ped))
+            ApplyPostAimSecondArmPose(ped);
+    }
+
+    static bool EnsureAimGunBridgeInstalled() {
+        const uintptr_t hookTarget = reinterpret_cast<uintptr_t>(&PedAimGunHook);
+        uintptr_t currentTarget = 0;
+        int32_t currentRel = 0;
+        if (!DecodeRelativeCall(ADDR_PED_AIMGUN_CALL, currentTarget, currentRel))
+            return false;
+
+        if (currentTarget == hookTarget)
+            return true;
+
+        if (gAimPatch.installed) {
+            if (!gLoggedAimRechain) {
+                char line[320];
+                std::snprintf(line, sizeof(line),
+                    "DualWieldIII: AimGun CALL replaced after our bridge (current=%p); not re-hooking to avoid a hook cycle.",
+                    reinterpret_cast<void*>(currentTarget));
+                Log(line);
+                gLoggedAimRechain = true;
+            }
+            return false;
+        }
+
+        if (!InstallCallPatch(ADDR_PED_AIMGUN_CALL, ADDR_PED_AIMGUN,
+            reinterpret_cast<void*>(&PedAimGunHook), gAimPatch)) {
+            if (!gLoggedAimInstallFailure) {
+                Log("DualWieldIII: AimGun CALL hook unavailable; stock-skeleton early IK disabled. Skin & Bones transactional local-HAnim solver remains available.");
+                gLoggedAimInstallFailure = true;
+            }
+            return false;
+        }
+
+        {
+            char line[320];
+            std::snprintf(line, sizeof(line),
+                "DualWieldIII: AimGun bridge active at 0x4CB037. previous=%p%s.",
+                reinterpret_cast<void*>(gAimPatch.previousTarget),
+                gAimPatch.chained ? " [CHAINED]" : "");
+            Log(line);
+        }
+        return true;
+    }
+
+    static void __fastcall PedRenderBridge(CPed* ped, void*) {
         PedRenderCallFn previous = reinterpret_cast<PedRenderCallFn>(
             gRenderPatch.previousTarget ? gRenderPatch.previousTarget : ADDR_ENTITY_RENDER);
+
+        RpHAnimHierarchy* hierarchy = 0;
+        SkinnedSecondArmBackup backup;
+        float blend = 0.0f;
+        bool posed = false;
+
+        // Skin & Bones calls CEntity::UpdateRpHAnim from CPed::PreRender before this
+        // render site. Rebuild from the clean animation/native-IK state, then apply one
+        // TEMPORARY local-HAnim opposite-arm correction and let RenderWare rebuild the
+        // complete chain. No independent final bone matrices are authored here.
+        bool weaponTransformPrepared = false;
+        if (ped && IsEligiblePlayer(ped) && IsSkinnedPed(ped)) {
+            posed = PrepareTemporarySkinnedSecondArmPose(ped, hierarchy, backup, blend);
+            if (posed) {
+                ++gRenderMirrorHits;
+                if (gLeft.owner == ped && gLeft.skinnedSource && IsAtomicAliveForOwner(ped))
+                    weaponTransformPrepared = UpdateLeftWeaponWorldTransform();
+            }
+        }
+
         if (previous && reinterpret_cast<uintptr_t>(previous) != reinterpret_cast<uintptr_t>(&PedRenderBridge))
             previous(ped);
 
-        // Render our private weapon only after the existing ped renderer returns. It is
-        // never enumerated as part of the body clump, which is the crash-critical rule.
-        RenderStandaloneLeftWeapon(ped);
+        // The body and Skin & Bones' separate hand have just rendered from the same
+        // coherently rebuilt HAnim snapshot. If we prepared the second weapon before
+        // that draw, do NOT sample the hierarchy again: render the frozen helper matrix
+        // verbatim so the gun and the fist come from the exact same solved hand.
+        RenderStandaloneLeftWeapon(ped, weaponTransformPrepared);
+
+        // Do not leak visual matrix edits into later systems or the next frame.
+        if (posed)
+            RestoreSkinnedSecondArm(hierarchy, backup);
+        gPoseNativeHandBasisValid = false;
+        gSolvedSecondHandGripValid = false;
     }
 
     static bool EnsureRenderBridgeInstalled() {
@@ -1455,8 +3154,9 @@ namespace DualWieldIII {
         // All normal ASIs have finished startup before the first gameProcess tick, so the
         // initial install chains the settled owner of this CALL (stock, Skin & Bones,
         // Proper Shaders, Plugin-SDK event bridge, etc.). If somebody replaces the CALL
-        // later, do not chase/re-chain it every frame: a late wrapper may have captured
+        // later, DO NOT chase/re-chain it every frame: a late wrapper may have captured
         // our bridge as its predecessor, and hooking that wrapper back can create a cycle.
+        // Leave the newer owner intact and log once instead of risking recursive rendering.
         if (gRenderPatch.installed) {
             if (!gLoggedRenderRechain) {
                 char line[320];
@@ -1485,7 +3185,26 @@ namespace DualWieldIII {
         return true;
     }
 
+    static void LogRuntimeSummary() {
+        if (gLoggedRuntimeSummary)
+            return;
+        char line[320];
+        std::snprintf(line, sizeof(line),
+            "DualWieldIII summary: postAim=%u renderPose=%u moveAimClearSuppressed=%u cachedAimPose=%u shots=%u/%u skinned=%d aimPrev=%p renderPrev=%p.",
+            gPostAimPoseHits, gRenderMirrorHits, gMoveAimClearSuppressions, gCachedAimPoseUses,
+            gSecondShotSuccess, gSecondShotAttempts, gLoggedSkinnedPedMode ? 1 : 0,
+            reinterpret_cast<void*>(gAimPatch.previousTarget),
+            reinterpret_cast<void*>(gRenderPatch.previousTarget));
+        Log(line);
+        gLoggedRuntimeSummary = true;
+    }
+
     static void OnPedDestroy(CPed* ped) {
+        if (ped && (ped == gLeft.owner || ped == gStableNativeAimPose.owner)) {
+            InvalidateStableNativeAimPose();
+            gAimIntentHoldRemaining = 0;
+            gAimIntentLatched = false;
+        }
         if (ped && ped == gLeft.owner)
             DestroyLeftWeapon();
     }
@@ -1493,6 +3212,10 @@ namespace DualWieldIII {
     static void OnPedSetModel(CPed* ped) {
         if (!ped || ped != gLeft.owner)
             return;
+        Log("DualWieldIII: pedSetModelEvent observed; destroying standalone second weapon before rebinding frames.");
+        InvalidateStableNativeAimPose();
+        gAimIntentHoldRemaining = 0;
+        gAimIntentLatched = false;
         DestroyLeftWeapon();
     }
 
@@ -1503,7 +3226,7 @@ namespace DualWieldIII {
             BuildSiblingPath(gLogPath, sizeof(gLogPath), "DualWieldIII.log");
             std::remove(gLogPath);
             LoadConfig();
-            Log("DualWieldIII: initialized.");
+            Log("DualWieldIII: initialized aim-continuity dual-wield controller.");
 
             const bool fireOk = InstallCallPatch(
                 ADDR_ATTACK_FIRE_CALL, ADDR_WEAPON_FIRE,
@@ -1524,31 +3247,44 @@ namespace DualWieldIII {
             }
 
             ResolveSkinBonesApi();
-            // Do not patch 0x4D0484 from the ASI constructor. Skin & Bones and shader
-            // mods may install their own render bridges during startup; gameProcess chains
-            // the settled owner instead of participating in a load-order race.
+            // Deliberately do NOT patch 0x4D0484 from the ASI constructor. Skin & Bones
+            // and shader mods may install their own render bridges during startup. The
+            // first gameProcess tick occurs after ASI initialization and chains the final
+            // owner instead of participating in a load-order race.
             Events::gameProcessEvent += [] {
                 ResolveSkinBonesApi();
+                EnsureMoveAimContinuityBridgeInstalled();
+                EnsureAimGunBridgeInstalled();
                 EnsureRenderBridgeInstalled();
                 UpdateLeftWeapon();
-            };
+
+                CPed* player = CurrentPlayer();
+                ApplyLateProcessSecondArmPose(player);
+                };
             Events::pedSetModelEvent += [](CPed* ped, int) {
                 OnPedSetModel(ped);
-            };
+                };
             Events::pedDtorEvent += [](CPed* ped) {
                 OnPedDestroy(ped);
-            };
+                };
             Events::restartGameEvent += [] {
+                InvalidateStableNativeAimPose();
+                gAimIntentHoldRemaining = 0;
+                gAimIntentLatched = false;
                 DestroyLeftWeapon();
-            };
+                };
             Events::shutdownRwEvent += [] {
+                LogRuntimeSummary();
                 DestroyLeftWeapon();
-            };
+                };
         }
 
         ~Mod() {
             // RW teardown is handled by shutdownRwEvent while the engine is alive.
+            LogRuntimeSummary();
             RestoreCallPatch(gRenderPatch);
+            RestoreCallPatch(gAimPatch);
+            RestoreCallPatch(gMoveClearAimPatch);
             RestoreCallPatch(gFirePatch);
         }
     };
