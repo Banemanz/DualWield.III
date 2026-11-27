@@ -1,0 +1,10 @@
+# Local build products
+/_deps/
+/bin/
+/obj/
+/package/
+/test_ik
+/ik-test.exe
+/*.obj
+/*.pdb
+/*.zip

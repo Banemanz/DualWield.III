@@ -1,0 +1,80 @@
+name: Build DualWield.III
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test standalone IK geometry
+        run: |
+          g++ -std=c++17 -O2 -Wall -Wextra -Werror tests/test_ik.cpp -o test_ik
+          ./test_ik
+  build-win32:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout pinned Plugin-SDK (October 25, 2025)
+        uses: actions/checkout@v4
+        with:
+          repository: DK22Pac/plugin-sdk
+          ref: 624a6a49265fd7a6fc63bda1611013ceabeacb8a
+          path: _deps/plugin-sdk
+          submodules: recursive
+      - uses: microsoft/setup-msbuild@v2
+      - name: Test standalone IK geometry on x86
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x86
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++17 /EHsc /W4 /O2 /Fe:ik-test.exe tests\test_ik.cpp
+          if errorlevel 1 exit /b 1
+          ik-test.exe
+          if errorlevel 1 exit /b 1
+      - name: Build Plugin-SDK for GTA III (Win32 Release)
+        shell: cmd
+        env:
+          PLUGIN_SDK_DIR: ${{ github.workspace }}\_deps\plugin-sdk
+        run: |
+          cd /d "%PLUGIN_SDK_DIR%"
+          call "tools\generate\Visual Studio.bat"
+          if errorlevel 1 exit /b 1
+          msbuild plugin.sln /m /t:plugin_iii /p:Configuration=Release /p:Platform="Mixed Platforms" /v:minimal
+          if errorlevel 1 exit /b 1
+      - name: Build DualWieldIII.asi
+        shell: cmd
+        env:
+          PLUGIN_SDK_DIR: ${{ github.workspace }}\_deps\plugin-sdk
+        run: |
+          msbuild DualWieldIII.vcxproj /m /p:Configuration="Release GTA3" /p:Platform=Win32 /v:minimal
+          if errorlevel 1 exit /b 1
+      - name: Verify PE x86 and package
+        shell: pwsh
+        run: |
+          $asi = 'bin/GTA3/Release/DualWieldIII.asi'
+          $bytes = [IO.File]::ReadAllBytes((Resolve-Path $asi))
+          $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+          if ([BitConverter]::ToUInt32($bytes, $pe) -ne 0x4550 -or [BitConverter]::ToUInt16($bytes, $pe + 4) -ne 0x14c) {
+            throw 'Expected a 32-bit x86 PE image'
+          }
+          New-Item -ItemType Directory -Force -Path package | Out-Null
+          Copy-Item $asi,DualWieldIII.ini,README.md package/
+          Compress-Archive -Path package/* -DestinationPath DualWieldIII-Win32.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DualWieldIII-Win32
+          path: DualWieldIII-Win32.zip
+          if-no-files-found: error
+          retention-days: 30
