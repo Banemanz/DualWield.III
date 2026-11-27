@@ -1,73 +1,39 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="676" viewBox="0 0 1024 676">
-<rect width="1024" height="676" fill="#101923"/>
-<style>text{font-family:Arial,sans-serif;fill:#e7edf4}.title{font-size:26px;font-weight:bold}.muted{font-size:14px;fill:#a7b8c9}.label{font-size:17px;font-weight:bold}</style>
-<text x="24" y="38" class="title">DualWieldIII — compact aiming stance (v23)</text>
-<text x="24" y="62" class="muted">Synthetic reproduction of a sideways native elbow with an elevated gun; top-down projections.</text>
-<text x="24" y="87" class="muted">Gray = native arm (unchanged); gold = opposite arm in v22; teal = opposite arm in v23.</text>
-<rect x="24" y="106" width="480" height="250" rx="14" fill="#192737" stroke="#314657"/>
-<text x="38" y="130" class="label">Free aim · v22</text>
-<ellipse cx="272.00" cy="271.00" rx="49" ry="24" fill="#73879b" opacity=".30"/>
-<line x1="220.30" y1="271.00" x2="323.70" y2="271.00" stroke="#9baec0" stroke-width="3" stroke-linecap="round" />
-<line x1="220.30" y1="322.70" x2="220.30" y2="134.70" stroke="#e1927d" stroke-width="1" stroke-linecap="round" stroke-dasharray="5 5" opacity=".5"/>
-<line x1="323.70" y1="271.00" x2="391.85" y2="259.25" stroke="#a3b0bd" stroke-width="4" stroke-linecap="round" />
-<line x1="391.85" y1="259.25" x2="388.32" y2="211.07" stroke="#a3b0bd" stroke-width="4" stroke-linecap="round" />
-<line x1="220.30" y1="271.00" x2="148.57" y2="259.88" stroke="#f0bd72" stroke-width="7" stroke-linecap="round" />
-<line x1="148.57" y1="259.88" x2="153.31" y2="208.88" stroke="#f0bd72" stroke-width="7" stroke-linecap="round" />
-<circle cx="220.30" cy="271.00" r="5" fill="#e7edf4"/>
-<circle cx="148.57" cy="259.88" r="5" fill="#f0bd72"/>
-<circle cx="153.31" cy="208.88" r="5" fill="#f0bd72"/>
-<circle cx="323.70" cy="271.00" r="5" fill="#a3b0bd"/>
-<circle cx="391.85" cy="259.25" r="5" fill="#a3b0bd"/>
-<circle cx="388.32" cy="211.07" r="5" fill="#a3b0bd"/>
-<text x="38" y="340" class="muted">Wrist lateral spread: 28.5 cm · Shoulder to wrist: 41.5 cm</text>
-<rect x="521" y="106" width="480" height="250" rx="14" fill="#192737" stroke="#314657"/>
-<text x="535" y="130" class="label">Free aim · v23</text>
-<ellipse cx="769.00" cy="271.00" rx="49" ry="24" fill="#73879b" opacity=".30"/>
-<line x1="717.30" y1="271.00" x2="820.70" y2="271.00" stroke="#9baec0" stroke-width="3" stroke-linecap="round" />
-<line x1="717.30" y1="322.70" x2="717.30" y2="134.70" stroke="#e1927d" stroke-width="1" stroke-linecap="round" stroke-dasharray="5 5" opacity=".5"/>
-<line x1="820.70" y1="271.00" x2="888.85" y2="259.25" stroke="#a3b0bd" stroke-width="4" stroke-linecap="round" />
-<line x1="888.85" y1="259.25" x2="885.33" y2="211.07" stroke="#a3b0bd" stroke-width="4" stroke-linecap="round" />
-<line x1="717.30" y1="271.00" x2="711.83" y2="198.67" stroke="#65d6c2" stroke-width="7" stroke-linecap="round" />
-<line x1="711.83" y1="198.67" x2="717.30" y2="149.51" stroke="#65d6c2" stroke-width="7" stroke-linecap="round" />
-<circle cx="717.30" cy="271.00" r="5" fill="#e7edf4"/>
-<circle cx="711.83" cy="198.67" r="5" fill="#65d6c2"/>
-<circle cx="717.30" cy="149.51" r="5" fill="#65d6c2"/>
-<circle cx="820.70" cy="271.00" r="5" fill="#a3b0bd"/>
-<circle cx="888.85" cy="259.25" r="5" fill="#a3b0bd"/>
-<circle cx="885.33" cy="211.07" r="5" fill="#a3b0bd"/>
-<text x="535" y="340" class="muted">Wrist lateral spread: 0.0 cm · Shoulder to wrist: 56.2 cm</text>
-<rect x="24" y="371" width="480" height="250" rx="14" fill="#192737" stroke="#314657"/>
-<text x="38" y="395" class="label">Point-blank cross-body lock · v22</text>
-<ellipse cx="272.00" cy="536.00" rx="49" ry="24" fill="#73879b" opacity=".30"/>
-<line x1="220.30" y1="536.00" x2="323.70" y2="536.00" stroke="#9baec0" stroke-width="3" stroke-linecap="round" />
-<line x1="220.30" y1="587.70" x2="220.30" y2="399.70" stroke="#e1927d" stroke-width="1" stroke-linecap="round" stroke-dasharray="5 5" opacity=".5"/>
-<line x1="323.70" y1="536.00" x2="391.85" y2="524.25" stroke="#a3b0bd" stroke-width="4" stroke-linecap="round" />
-<line x1="391.85" y1="524.25" x2="388.32" y2="476.07" stroke="#a3b0bd" stroke-width="4" stroke-linecap="round" />
-<line x1="220.30" y1="536.00" x2="157.32" y2="499.71" stroke="#f0bd72" stroke-width="7" stroke-linecap="round" />
-<line x1="157.32" y1="499.71" x2="217.26" y2="477.96" stroke="#f0bd72" stroke-width="7" stroke-linecap="round" />
-<circle cx="220.30" cy="536.00" r="5" fill="#e7edf4"/>
-<circle cx="157.32" cy="499.71" r="5" fill="#f0bd72"/>
-<circle cx="217.26" cy="477.96" r="5" fill="#f0bd72"/>
-<circle cx="323.70" cy="536.00" r="5" fill="#a3b0bd"/>
-<circle cx="391.85" cy="524.25" r="5" fill="#a3b0bd"/>
-<circle cx="388.32" cy="476.07" r="5" fill="#a3b0bd"/>
-<circle cx="243.80" cy="524.25" r="5" fill="#f38a77"/>
-<text x="38" y="605" class="muted">Wrist lateral spread: 1.3 cm · Shoulder to wrist: 25.1 cm</text>
-<rect x="521" y="371" width="480" height="250" rx="14" fill="#192737" stroke="#314657"/>
-<text x="535" y="395" class="label">Point-blank cross-body lock · v23</text>
-<ellipse cx="769.00" cy="536.00" rx="49" ry="24" fill="#73879b" opacity=".30"/>
-<line x1="717.30" y1="536.00" x2="820.70" y2="536.00" stroke="#9baec0" stroke-width="3" stroke-linecap="round" />
-<line x1="717.30" y1="587.70" x2="717.30" y2="399.70" stroke="#e1927d" stroke-width="1" stroke-linecap="round" stroke-dasharray="5 5" opacity=".5"/>
-<line x1="820.70" y1="536.00" x2="888.85" y2="524.25" stroke="#a3b0bd" stroke-width="4" stroke-linecap="round" />
-<line x1="888.85" y1="524.25" x2="885.33" y2="476.07" stroke="#a3b0bd" stroke-width="4" stroke-linecap="round" />
-<line x1="717.30" y1="536.00" x2="711.83" y2="463.60" stroke="#65d6c2" stroke-width="7" stroke-linecap="round" />
-<line x1="711.83" y1="463.60" x2="717.30" y2="414.03" stroke="#65d6c2" stroke-width="7" stroke-linecap="round" />
-<circle cx="717.30" cy="536.00" r="5" fill="#e7edf4"/>
-<circle cx="711.83" cy="463.60" r="5" fill="#65d6c2"/>
-<circle cx="717.30" cy="414.03" r="5" fill="#65d6c2"/>
-<circle cx="820.70" cy="536.00" r="5" fill="#a3b0bd"/>
-<circle cx="888.85" cy="524.25" r="5" fill="#a3b0bd"/>
-<circle cx="885.33" cy="476.07" r="5" fill="#a3b0bd"/>
-<circle cx="740.80" cy="524.25" r="5" fill="#f38a77"/>
-<text x="535" y="605" class="muted">Wrist lateral spread: 0.0 cm · Shoulder to wrist: 56.2 cm</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="520" viewBox="0 0 1000 520">
+<rect width="1000" height="520" fill="#101923"/>
+<style>text{font-family:Arial,sans-serif;fill:#e7edf4}.title{font-size:25px;font-weight:bold}.muted{font-size:14px;fill:#a7b8c9}.label{font-size:18px;font-weight:bold}</style>
+<text x="24" y="35" class="title">v24 — native ray and front-of-chest convergence</text>
+<text x="24" y="61" class="muted">Controlled synthetic repro: aim 40° to the right of torso, elevated 15°. Not in-game captures.</text>
+<text x="24" y="86" class="muted">Gray: unchanged native arm; gold/teal: left arm; dotted arrow: intended aim ray.</text>
+<rect x="24" y="108" width="470" height="388" rx="14" fill="#192737" stroke="#314657"/>
+<text x="38" y="134" class="label">v23: outward-only wrist</text>
+<ellipse cx="248" cy="377" rx="57" ry="32" fill="#73879b" opacity=".30"/>
+<line x1="189.70" y1="377.00" x2="306.30" y2="377.00" stroke="#9baec0" stroke-width="3" stroke-linecap="round" />
+<line x1="189.70" y1="430.00" x2="189.70" y2="172.95" stroke="#e1927d" stroke-width="1" stroke-linecap="round" stroke-dasharray="5 5" opacity=".55"/>
+<line x1="168.50" y1="342.02" x2="327.50" y2="342.02" stroke="#a9a9a9" stroke-width="1" stroke-linecap="round" stroke-dasharray="4 5" opacity=".55"/>
+<line x1="306.30" y1="377.00" x2="338.10" y2="310.75" stroke="#a3b0bd" stroke-width="4" stroke-linecap="round" />
+<line x1="338.10" y1="310.75" x2="384.17" y2="255.85" stroke="#a3b0bd" stroke-width="4" stroke-linecap="round" />
+<line x1="189.70" y1="230.51" x2="230.83" y2="181.49" stroke="#eddf9a" stroke-width="2" stroke-linecap="round" stroke-dasharray="4 5"/>
+<line x1="189.70" y1="377.00" x2="183.53" y2="295.00" stroke="#f0bd72" stroke-width="7" stroke-linecap="round" />
+<line x1="183.53" y1="295.00" x2="189.70" y2="230.51" stroke="#f0bd72" stroke-width="7" stroke-linecap="round" />
+<circle cx="189.70" cy="377.00" r="5" fill="#e7edf4"/>
+<circle cx="183.53" cy="295.00" r="5" fill="#f0bd72"/>
+<circle cx="189.70" cy="230.51" r="5" fill="#f0bd72"/>
+<text x="38" y="462" class="muted">Forearm deviation from aim: 34.9°</text>
+<text x="38" y="483" class="muted">Wrist forced outside shoulder plane</text>
+<rect x="514" y="108" width="470" height="388" rx="14" fill="#192737" stroke="#314657"/>
+<text x="528" y="134" class="label">v24: forearm follows aim</text>
+<ellipse cx="738" cy="377" rx="57" ry="32" fill="#73879b" opacity=".30"/>
+<line x1="679.70" y1="377.00" x2="796.30" y2="377.00" stroke="#9baec0" stroke-width="3" stroke-linecap="round" />
+<line x1="679.70" y1="430.00" x2="679.70" y2="172.95" stroke="#e1927d" stroke-width="1" stroke-linecap="round" stroke-dasharray="5 5" opacity=".55"/>
+<line x1="658.50" y1="342.02" x2="817.50" y2="342.02" stroke="#a9a9a9" stroke-width="1" stroke-linecap="round" stroke-dasharray="4 5" opacity=".55"/>
+<line x1="796.30" y1="377.00" x2="828.10" y2="310.75" stroke="#a3b0bd" stroke-width="4" stroke-linecap="round" />
+<line x1="828.10" y1="310.75" x2="874.17" y2="255.85" stroke="#a3b0bd" stroke-width="4" stroke-linecap="round" />
+<line x1="749.54" y1="244.55" x2="790.67" y2="195.53" stroke="#eddf9a" stroke-width="2" stroke-linecap="round" stroke-dasharray="4 5"/>
+<line x1="679.70" y1="377.00" x2="703.37" y2="299.56" stroke="#65d6c2" stroke-width="7" stroke-linecap="round" />
+<line x1="703.37" y1="299.56" x2="749.54" y2="244.55" stroke="#65d6c2" stroke-width="7" stroke-linecap="round" />
+<circle cx="679.70" cy="377.00" r="5" fill="#e7edf4"/>
+<circle cx="703.37" cy="299.56" r="5" fill="#65d6c2"/>
+<circle cx="749.54" cy="244.55" r="5" fill="#65d6c2"/>
+<text x="528" y="462" class="muted">Forearm deviation from aim: 0.0°</text>
+<text x="528" y="483" class="muted">Wrist converges in front of torso</text>
 </svg>
