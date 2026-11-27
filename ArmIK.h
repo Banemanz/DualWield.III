@@ -30,6 +30,7 @@ struct Input {
     Vec shoulder, elbow, hand;
     Vec forward, up;
     Vec target;                    // shared world target when lock-on is active
+    Vec nativeAim{};               // native weapon world direction, not reflected
     bool locked=false;
     float blend=1.f;
     float reachScale=.98f;
@@ -40,19 +41,17 @@ struct Output {
     float upperLength, lowerLength, clearance;
 };
 
-// Keep the wrist in an outward/forward yaw sector without cutting off pitch.
-// A small outward yaw at straight ahead avoids the chest even at steep pitch.
-// Backward lock-on is saturated at the side rather than folding across the body.
+// A compact shooting envelope in the live torso plane. Limit lateral spread
+// relative to total arm length, not just world yaw. Using the same pitch plane
+// as the native gun keeps the forearm forward instead of mirroring a bent arm.
 inline Vec safeDirection(Vec v, Vec outside, Vec forward, Vec up) {
     v=unit(v,forward);
     const float x=dot(v,outside), y=dot(v,forward), z=clamp(dot(v,up),-1.f,1.f);
     const float horizontal=std::sqrt(x*x+y*y);
+    // Never swing around to the rear/side to chase an unreachable lock-on.
+    // An inboard target saturates at zero yaw and retains elevation.
     if(horizontal<1e-5f) return up*(z>=0.f?1.f:-1.f);
-    // Rearward/inboard targets use the forward limit continuously across
-    // the cross-body hemisphere; rearward/outboard targets use the side limit.
-    float yaw=std::atan2(x,y);
-    if(y<0.f) yaw=3.f*rad+82.f*rad*clamp(x/horizontal*1.5f,0.f,1.f);
-    yaw=clamp(yaw, 3.f*rad, 85.f*rad);
+    const float yaw=std::asin(clamp(x/horizontal,0.f,std::sin(16.f*rad)));
     return unit(outside*(horizontal*std::sin(yaw))+
                 forward*(horizontal*std::cos(yaw))+up*z,forward);
 }
@@ -80,38 +79,65 @@ inline bool solve(const Input& in, Output& out) {
     if(length(up)<.5f) return false;
 
     const Vec nativeReach=in.nativeHand-in.nativeShoulder;
-    Vec desired=reflect(nativeReach,outside); // natural symmetrical free aim
-    if(in.locked && length(in.target-in.shoulder)>1e-4f)
-        desired=in.target-in.shoulder; // both arms aim at the same target, not opposite yaw
-    float blend=clamp(in.blend,0.f,1.f);
+    const Vec nativeForearm=unit(in.nativeHand-in.nativeElbow,forward);
+    // The right shoulder->wrist vector can be sideways even though its gun is
+    // pointing forward. Reflecting that reach produced a wide left-arm punch.
+    // Take actual aim from the native gun, with a forearm fallback for bad data.
+    Vec desired=finite(in.nativeAim)&&length(in.nativeAim)>.5f
+        ? unit(in.nativeAim,nativeForearm) : nativeForearm;
+    if(in.locked) {
+        const Vec delta=in.target-in.shoulder;
+        const float dist=length(delta);
+        if(std::isfinite(dist)&&dist>1e-4f) {
+            // A target within the arm's own reach cannot dictate its extension;
+            // blend target intent smoothly instead of folding the wrist inward.
+            const float weight=clamp(dist/(a+b),0.f,1.f);
+            desired=unit(desired*(1.f-weight)+unit(delta,desired)*weight,desired);
+        }
+    }
+    const float blend=clamp(in.blend,0.f,1.f);
     const Vec desiredDir=safeDirection(desired,outside,forward,up);
     const Vec current=unit(in.hand-in.shoulder,desiredDir);
     const Vec dir=safeDirection(current*(1.f-blend)+desiredDir*blend,outside,forward,up);
 
-    // Limit elbow flexion by reach (8..130 degrees), independent of interpolation
-    // pose or frame rate. The arm length ratio is preserved for asymmetric rigs.
+    // A gun is held in an extended firing stance even when its target is very
+    // close. Treat native extension as a preference, not an excuse to collapse
+    // the arm into a defensive punch. Deliberate INI reach caps still apply.
     const float minReach=std::max(std::sqrt(a*a+b*b+2.f*a*b*std::cos(130.f*rad)),
                                   std::sqrt(std::max(0.f,b*b-a*a)));
     const float maxReach=std::sqrt(a*a+b*b+2.f*a*b*std::cos(8.f*rad));
     const float cap=std::max(minReach,std::min(maxReach,(a+b)*clamp(in.reachScale,.70f,1.f)));
+    const float minAimReach=std::min(cap,(a+b)*.95f);
     const float nativeRatio=clamp(length(nativeReach)/nativeLength,0.f,1.f);
-    float reach=clamp(length(in.hand-in.shoulder)*(1.f-blend)+(a+b)*nativeRatio*blend,minReach,cap);
-    if(in.locked) reach=clamp(std::min(reach,length(desired)),minReach,cap);
+    const float aimReach=clamp((a+b)*nativeRatio,minAimReach,cap);
+    const float reach=clamp(length(in.hand-in.shoulder)*(1.f-blend)+aimReach*blend,
+                            std::max(minReach,std::min(cap,(a+b)*(.82f+.13f*blend))),cap);
     const float along=(a*a-b*b+reach*reach)/(2.f*reach);
     const float radius=std::sqrt(std::max(0.f,a*a-along*along));
 
-    // Prefer the mirrored native elbow plane when it is anatomically safe.
-    // Bias toward the outside and down, not an arbitrary per-animation rotation cap.
-    const Vec outerPole=unit(project(outside,dir),unit(project(up*(-1.f),dir),forward));
-    const Vec natural=unit(project(reflect(in.nativeElbow-in.nativeShoulder,outside),dir),outerPole);
-    const Vec down=unit(project(up*(-1.f),dir),outerPole);
-    Vec pole=unit(project(natural*.60f + outerPole*(.75f+clamp(in.elbowFlareDeg,0.f,15.f)*.045f)
-                          + down*.18f,dir),outerPole);
-    const float clearance=-.035f*s; // a tiny tolerance at the shoulder surface
-    Vec elbow=in.shoulder+dir*along+pole*radius;
+    // Select the elbow on its exact solution circle. The default bend plane
+    // is vertical (elbow below the aim ray), NOT outward. The lateral basis
+    // and pitch basis are orthogonal; their coefficients let us enforce a
+    // small shoulder-relative envelope without changing either bone length.
+    const Vec outerPole=unit(project(outside,dir),outside);
+    Vec pitchPole=unit(cross(outside,dir),up*(-1.f));
+    if(dot(cross(outside,forward),up)>0.f) pitchPole=pitchPole*(-1.f);
+    const float clearance=-.025f*s;
+    const float elbowCenter=along*dot(dir,outside);
+    const float lateralRadius=radius*dot(outerPole,outside);
+    // Allow a little natural lateral elbow position, and optionally widen the
+    // envelope by user-requested flare. Even full flare is bounded.
+    const float maxElbowOut=std::max(.19f*a,.10f*s)+a*.16f*clamp(in.elbowFlareDeg/15.f,0.f,1.f);
+    const float preferredElbowOut=std::min(maxElbowOut,.075f*a+a*.13f*clamp(in.elbowFlareDeg/15.f,0.f,1.f));
+    float lateral=0.f;
+    if(lateralRadius>1e-6f) {
+        const float lo=clamp((clearance-elbowCenter)/lateralRadius,-1.f,1.f);
+        const float hi=clamp((maxElbowOut-elbowCenter)/lateralRadius,-1.f,1.f);
+        lateral=clamp((preferredElbowOut-elbowCenter)/lateralRadius,lo,hi);
+    }
+    const Vec pole=outerPole*lateral+pitchPole*std::sqrt(std::max(0.f,1.f-lateral*lateral));
+    const Vec elbow=in.shoulder+dir*along+pole*radius;
     const Vec hand=in.shoulder+dir*reach;
-    if(dot(elbow-in.shoulder,outside)<clearance)
-        elbow=in.shoulder+dir*along+outerPole*radius;
     if(!finite(elbow)||!finite(hand)||dot(elbow-in.shoulder,outside)<clearance-1e-5f||
        dot(hand-in.shoulder,outside)<clearance-1e-5f) return false;
     out={elbow,hand,outside,forward,a,b,clearance};

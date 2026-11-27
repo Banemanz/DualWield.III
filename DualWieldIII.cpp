@@ -1,5 +1,5 @@
 /*
-    DualWieldIII v22 - constrained dual-arm IK (GTA III 1.0 EN).
+    DualWieldIII v23 - compact dual-arm IK (GTA III 1.0 EN).
     Native weapon arm, aim-continuity hooks, weapon models and native double-shot
     behavior are preserved. The opposite arm uses a shared anatomical two-link
     target solve, applied to stock local RwFrames or Xbox/Skin & Bones local
@@ -1656,10 +1656,14 @@ namespace DualWieldIII {
         return DualWieldIK::finite(target);
     }
 
-    static void SetIKControls(CPed* ped, float blend, DualWieldIK::Input& input) {
+    static void SetIKControls(CPed* ped, const RwMatrix& nativeHand, float blend, DualWieldIK::Input& input) {
         input.forward = IKVec(ped->GetForward());
         input.up = IKVec(ped->GetUp());
         input.locked = GetSharedLockTarget(ped, input.target);
+        CVector localFireDir;
+        if (GetActiveWeaponLocalFireDirection(ped, localFireDir)
+            && IsFiniteRwMatrix(nativeHand))
+            input.nativeAim = IKVec(BasisTransformDirection(BasisFromRwMatrix(&nativeHand), localFireDir));
         input.blend = blend;
         input.reachScale = gConfig.armReachScale;
         input.elbowFlareDeg = gConfig.elbowOutwardDeg;
@@ -1777,7 +1781,7 @@ namespace DualWieldIII {
         DualWieldIK::Input input{};
         input.nativeShoulder=IKPos(nU); input.nativeElbow=IKPos(nL); input.nativeHand=IKPos(nH);
         input.shoulder=IKPos(u); input.elbow=IKPos(l); input.hand=IKPos(h);
-        SetIKControls(ped, blend, input);
+        SetIKControls(ped, nH, blend, input);
         DualWieldIK::Output solved{};
         if (!DualWieldIK::solve(input, solved))
             return false;
@@ -2150,7 +2154,7 @@ namespace DualWieldIII {
         input.nativeElbow=input.nativeShoulder + (IKPos(nativeLowerSource)-IKPos(nativeUpperSource));
         input.nativeHand=input.nativeShoulder + (IKPos(nativeHandSource)-IKPos(nativeUpperSource));
         input.shoulder=IKPos(*u); input.elbow=IKPos(*l); input.hand=IKPos(*h);
-        SetIKControls(ped,blend,input);
+        SetIKControls(ped,nativeHandSource,blend,input);
         DualWieldIK::Output solved{};
         if (!DualWieldIK::solve(input,solved)) return false;
         // Bounds are on the target geometry, not arbitrary deltas from walking
@@ -2785,7 +2789,7 @@ namespace DualWieldIII {
             BuildSiblingPath(gLogPath, sizeof(gLogPath), "DualWieldIII.log");
             std::remove(gLogPath);
             LoadConfig();
-            Log("DualWieldIII: initialized aim-continuity dual-wield controller.");
+            Log("DualWieldIII v23: initialized compact dual-arm IK controller.");
 
             const bool fireOk = InstallCallPatch(
                 ADDR_ATTACK_FIRE_CALL, ADDR_WEAPON_FIRE,
